@@ -1,0 +1,295 @@
+---
+title: "Causal Survival - Case Base"
+output: pdf_document
+date: "2026-05-28"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+\newpage
+# Imports
+
+### EDA
+```{r, warning=FALSE, message=FALSE}
+library("tableone")
+library("xtable")
+```
+
+### Cox PH Model
+```{r, warning=FALSE, message=FALSE}
+library("survival")
+```
+
+### SMD Balance
+```{r, warning=FALSE, message=FALSE}
+library("survey")
+library("cobalt")
+```
+
+### Case Base
+```{r, warning=FALSE, message=FALSE}
+library("casebase")
+```
+
+\newpage
+# EDA
+
+## Data Set
+
+```{r}
+#set seed
+set.seed(2026)
+```
+
+```{r}
+#re-factor the data set
+
+#main variables of interest
+time <- flchain$futime
+Delta <- flchain$death
+A <- flchain$???
+
+#covriates
+Gender <- flchain$sex
+Age <- flchain$age
+Kappa <- flchain$kappa
+Lambda <- flchain$lambda
+FLC.Group <- flchain$flc.grp
+
+#data set design
+data.set <- data.frame(
+  time = time,
+  Delta = Delta,
+  A = A,
+  Gender = Gender,
+  Age = Age,
+  Kappa = Kappa,
+  Lambda = Lambda,
+  FLC.Group = FLC.Group
+)
+```
+
+\newpage
+## Table One
+```{r}
+covariates = c(
+  "Gender",
+  "Age",
+  "Kappa",
+  "Lambda",
+  "FLC.Group"
+)
+
+table.one.original <- CreateTableOne(
+  vars = covariates,
+  strata = "A",
+  data = data.set,
+  test = FALSE
+)
+
+print(table.one.original, smd = TRUE)
+```
+\newpage
+## Propensity Scores
+```{r}
+#generate propensity scores
+propensity.score <- fitted(
+  glm(
+    A ~ Gender +
+      Age + 
+      Kappa + 
+      Lambda + 
+      FLC.Group,
+    data = data.set,
+    family = binomial(link = "logit")
+  )
+)
+
+#separate propensity scores for exposed & unexposed groups
+propensity.score.0 <- propensity.score[A == 0]
+propensity.score.1 <- propensity.score[A == 1]
+
+#visualize the propensity scores overlap
+par(
+  mar=c(2,2,2,0)
+)
+
+hist(
+  propensity.score.0,
+  col=rgb(0,0,1,0.5),
+  breaks=seq(0,1,by=0.02),
+  ylim=c(0,100),
+  main="Propensity Score Overlap",
+  xlab="Propensity Scores"
+)
+
+hist(
+  propensity.score.1,
+  col=rgb(1,0,0,0.5),
+  breaks=seq(0,1,by=0.02),
+  add=T
+)
+
+box()
+
+legend(
+  "topright",
+  legend=c('A = 0', 'A = 1'),
+  fill=c(rgb(0,0,1,0.5),rgb(1,0,0,0.5)),
+  border="black", bty="n"
+)
+```
+
+\newpage
+## Stabilized IPW
+```{r}
+p.A1 <- mean(A)
+
+#calculate stabilized ipw
+ipw <- ifelse(
+  A == 1,
+  p.A1 / propensity.score,
+  (1 - p.A1) / (1 - propensity.score)
+)
+
+hist(
+  ipw,
+  breaks=seq(0,370,by=0.02),
+  ylim = c(0, 7000),
+  main="IPW Distribution",
+  xlab="IPWs"
+)
+box()
+```
+\newpage
+## Covariate Balance
+```{r}
+#calculate the covariate balance before & after IPW
+balance <- bal.tab(
+  A ~ Gender + 
+    Age + 
+    Kappa + 
+    Lambda +
+    FLC.Group,
+  data = data.set,
+  weights = ipw,
+  method = "weighting",
+  estimand = "Average Treatment Effect",
+  un = TRUE
+)
+
+#visualize the covariate balance before & after IPW
+love.plot(
+  balance,
+  stats = "mean.diffs",
+  threshold = 0.1,
+  abs = TRUE,
+  line = TRUE,
+  var.order = "unadjusted",
+  colors = c("red", "blue"),
+  shapes = c(17, 16),
+  limits = c(m = c(0, 0.7)), #hard-coded 0.7??
+  title = "Covariate Balance Before and After IPW",
+  labels = TRUE
+)
+```
+
+\newpage
+## Table Two
+```{r}
+data.set.ipw <- svydesign(
+  ids = ~ 0,
+  data = data.set,
+  weights = ipw
+)
+
+table.one.ipw <- svyCreateTableOne(
+  vars = covariates,
+  strata = "A",
+  data = data.set.ipw,
+  test = FALSE
+)
+
+print(table.one.ipw, smd = TRUE)
+```
+\newpage
+# Estimation
+
+## Assumptions
+*Non-Informative Censoring*
+
+\newpage
+## Model 1: Unadjusted Cox
+```{r}
+#fit model
+model.1 <- coxph(
+  Surv(time, Delta) ~ A,
+  data = data.set,
+  robust = TRUE
+)
+
+#generate summary
+summary(model.1)
+```
+\newpage
+## Model 2: Covariate Adjusted Cox
+```{r}
+#fit model
+model.2 <- coxph(
+  Surv(time, Delta) ~ A +
+    Gender +
+    Age +
+    Kappa +
+    Lambda +
+    FLC.Group,
+  data = data.set,
+  robust = TRUE
+)
+
+#generate summary
+summary(model.2)
+```
+\newpage
+## Model 3: Marginal Structural Cox
+```{r}
+#fit model
+model.3 <- coxph(
+  Surv(time, Delta) ~ A,
+  data = data.set,
+  weights = ipw,
+  robust = TRUE
+)
+
+#generate summary
+summary(model.3)
+```
+\newpage
+## Model 4: IPW Case Base PH
+```{r}
+#fit model
+model.4 <- fitSmoothHazard(
+  Delta ~ time * A,
+  data = data.set,
+  ratio = 10,
+  weights = ipw
+)
+
+#generate summary
+summary(model.4)
+```
+\newpage
+## Model 5: IPW Case Base (Variable Hazard over Time)
+```{r}
+#fit model
+model.5 <- fitSmoothHazard(
+  Delta ~ pspline(time, df = 2) * A,
+  data = data.set,
+  ratio = 10,
+  weights = ipw
+)
+
+#generate summary
+summary(model.5)
+```

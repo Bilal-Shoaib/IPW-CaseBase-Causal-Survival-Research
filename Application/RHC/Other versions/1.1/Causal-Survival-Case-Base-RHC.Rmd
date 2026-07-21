@@ -1,0 +1,595 @@
+---
+title: "Causal Survival - Case Base"
+output: pdf_document
+date: "2026-05-31"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+\newpage
+# Imports
+
+### EDA
+```{r, warning=FALSE, message=FALSE}
+library("Hmisc")
+library("tableone")
+library("xtable")
+library("ggplot2")
+```
+
+### Cox PH Model
+```{r, warning=FALSE, message=FALSE}
+library("survival")
+```
+
+### SMD Balance
+```{r, warning=FALSE, message=FALSE}
+library("survey")
+library("cobalt")
+```
+
+### Case Base
+```{r, warning=FALSE, message=FALSE}
+library("casebase")
+```
+
+\newpage
+# EDA
+
+## Data Set
+```{r}
+#set seed
+seed = 123
+
+#load the dataset
+getHdata(rhc)
+```
+
+```{r}
+#re-factor the data set
+
+##main variables of interest
+
+###time: last contact/death date - start date
+time <- pmax(rhc$dthdte, rhc$lstctdte, na.rm = TRUE) - rhc$sadmdte
+
+###event: death
+Delta <- ifelse(
+  rhc$death == "Yes",
+  1,
+  0
+)
+
+###treatment: rhc performed or not
+A <- ifelse(
+  rhc$swang1 == "RHC",
+  1,
+  0
+)
+
+##covriates
+
+###demographics
+Gender <- rhc$sex
+Age <- as.numeric(rhc$age)
+Weight <- as.numeric(rhc$wtkilo1)
+Race <- rhc$race
+Education <- as.numeric(rhc$edu)
+Income <- rhc$income
+InsuranceClass <- rhc$ninsclas
+
+###comorbidities
+hx_vars <- c(
+  "chfhx",
+  "cardiohx",
+  "dementhx",
+  "psychhx",
+  "chrpulhx",
+  "renalhx",
+  "liverhx",
+  "gibledhx",
+  "malighx",
+  "immunhx",
+  "transhx",
+  "amihx"
+)
+
+###convert labelled data to factors
+rhc[hx_vars] <- lapply(rhc[hx_vars], function(x) {
+  x <- as.numeric(x)
+
+  factor(ifelse(x == 1, "Yes", "No"),
+         levels = c("No", "Yes"))
+})
+
+CHFhx <- rhc$chfhx
+CARDIOhx <- rhc$cardiohx
+DEMENThx <- rhc$dementhx
+PSYCHhx <- rhc$psychhx
+CHRPULhx <- rhc$chrpulhx
+RENALhx <- rhc$renalhx
+LIVERhx <- rhc$liverhx
+GIBLEDhx <- rhc$gibledhx
+MALIGhx <- rhc$malighx
+IMMUNhx <- rhc$immunhx
+TRANShx <- rhc$transhx
+AMIhx <- rhc$amihx
+
+#severities
+Cancer <- rhc$ca
+Category <- rhc$cat1
+Severity <- as.numeric(rhc$das2d3pc)
+
+#data set design
+data.set <- data.frame(
+  time = time,
+  Delta = Delta,
+  A = A,
+  
+  Gender = Gender,
+  Age = Age,
+  Weight = Weight,
+  Race = Race,
+  Education = Education,
+  Income = Income,
+  InsuranceClass = InsuranceClass,
+  
+  CHFhx = CHFhx,
+  CARDIOhx = CARDIOhx,
+  DEMENThx = DEMENThx,
+  PSYCHhx = PSYCHhx,
+  CHRPULhx = CHRPULhx,
+  RENALhx = RENALhx,
+  LIVERhx = LIVERhx,
+  GIBLEDhx = GIBLEDhx,
+  MALIGhx = MALIGhx,
+  IMMUNhx = IMMUNhx,
+  TRANShx = TRANShx,
+  AMIhx = AMIhx,
+  
+  Cancer = Cancer,
+  Category = Category,
+  Severity = Severity
+)
+```
+
+\newpage
+## Table One
+```{r}
+covariates = c(
+  "Gender",
+  "Age",
+  "Weight",
+  "Race",
+  "Education",
+  "Income",
+  "InsuranceClass",
+  
+  "CHFhx",
+  "CARDIOhx",
+  "DEMENThx",
+  "PSYCHhx",
+  "CHRPULhx",
+  "RENALhx",
+  "LIVERhx",
+  "GIBLEDhx",
+  "MALIGhx",
+  "IMMUNhx",
+  "TRANShx",
+  "AMIhx",
+  
+  "Cancer",
+  "Category",
+  "Severity"
+)
+
+table.one.original <- CreateTableOne(
+  vars = covariates,
+  strata = "A",
+  data = data.set,
+  test = FALSE
+)
+print(table.one.original, smd = TRUE)
+```
+
+
+\newpage
+## Propensity Scores
+```{r}
+#set seed for output reproducibility
+set.seed(seed)
+
+#generate propensity scores
+propensity.score <- fitted(
+  glm(
+    A ~ Gender +
+      Age +
+      Weight +
+      Race +
+      Education +
+      Income +
+      InsuranceClass +
+      CHFhx +
+      CARDIOhx +
+      DEMENThx +
+      PSYCHhx +
+      CHRPULhx +
+      RENALhx +
+      LIVERhx +
+      GIBLEDhx +
+      MALIGhx +
+      IMMUNhx +
+      TRANShx +
+      AMIhx + 
+      Cancer + 
+      Category + 
+      Severity,
+    data = data.set,
+    family = binomial(link = "logit")
+  )
+)
+
+#separate propensity scores for exposed & unexposed groups
+propensity.score.0 <- propensity.score[A == 0]
+propensity.score.1 <- propensity.score[A == 1]
+
+#visualize the propensity scores overlap
+par(
+  mar=c(2,2,2,0)
+)
+
+hist(
+  propensity.score.0,
+  col=rgb(0,0,1,0.5),
+  breaks=seq(0,1,by=0.02),
+  ylim=c(0,350),
+  main="Propensity Score Overlap",
+  xlab="Propensity Scores"
+)
+
+hist(
+  propensity.score.1,
+  col=rgb(1,0,0,0.5),
+  breaks=seq(0,1,by=0.02),
+  add=T
+)
+
+box()
+
+legend(
+  "topright",
+  legend=c('A = 0', 'A = 1'),
+  fill=c(rgb(0,0,1,0.5),rgb(1,0,0,0.5)),
+  border="black", bty="n"
+)
+```
+
+\newpage
+## Stabilized IPW
+```{r}
+p.A1 <- mean(A)
+
+#calculate unstabilized ipws
+ipw.unstabilized <- ifelse(
+  A == 1,
+  1 / propensity.score,
+  1 / (1 - propensity.score)
+)
+
+#calculate stabilized ipws
+ipw.stabilized <- ifelse(
+  A == 1,
+  p.A1 / propensity.score,
+  (1 - p.A1) / (1 - propensity.score)
+)
+
+#visualize the ipws
+par(
+  mar=c(2,2,2,0)
+)
+
+hist(
+  ipw.unstabilized,
+  col=rgb(0,0,1,0.5),
+  breaks=seq(0, max(ipw.unstabilized) + 0.5,by=0.1),
+  ylim=c(0,1000),
+  main="Unstablized Vs. Stabilized IPWs",
+  xlab="IPWs"
+)
+
+hist(
+  ipw.stabilized,
+  col=rgb(1,0,0,0.5),
+  breaks=seq(0, max(ipw.stabilized) + 0.5,by=0.1),
+  add=T
+)
+
+box()
+
+legend(
+  "topright",
+  legend=c('Unstabilized', 'Stabilized'),
+  fill=c(rgb(0,0,1,0.5),rgb(1,0,0,0.5)),
+  border="black", bty="n"
+)
+```
+
+\newpage
+## Covariate Balance
+```{r, warning=FALSE, message=FALSE}
+#calculate the covariate balance before & after IPW
+balance <- bal.tab(
+  A ~ Gender +
+      Age +
+      Weight +
+      Race +
+      Education +
+      Income +
+      InsuranceClass +
+      CHFhx +
+      CARDIOhx +
+      DEMENThx +
+      PSYCHhx +
+      CHRPULhx +
+      RENALhx +
+      LIVERhx +
+      GIBLEDhx +
+      MALIGhx +
+      IMMUNhx +
+      TRANShx +
+      AMIhx + 
+      Cancer + 
+      Category + 
+      Severity,
+  data = data.set,
+  weights = ipw.stabilized,
+  method = "weighting",
+  estimand = "Average Treatment Effect",
+  un = TRUE
+)
+
+#visualize the covariate balance before & after IPW
+love.plot(
+  balance,
+  stats = "mean.diffs",
+  threshold = 0.1,
+  abs = TRUE,
+  line = TRUE,
+  var.order = "unadjusted",
+  colors = c("red", "blue"),
+  shapes = c(17, 16),
+  limits = c(m = c(0, 0.3)),
+  title = "Covariate Balance Before and After IPW",
+  labels = TRUE
+)
+```
+*Note that covariate balance improved substantially after the inverse probability weighting (IPW) procedure was applied to create the pseudo-population.
+*
+
+\newpage
+## Table Two
+```{r, warning=FALSE, message=FALSE}
+data.set.ipw <- svydesign(
+  ids = ~ 0,
+  data = data.set,
+  weights = ipw.stabilized
+)
+
+table.one.ipw <- svyCreateTableOne(
+  vars = covariates,
+  strata = "A",
+  data = data.set.ipw,
+  test = FALSE
+)
+
+print(table.one.ipw, smd = TRUE)
+```
+\newpage
+# Estimation
+
+## Assumptions
+*Non-Informative Censoring*
+
+\newpage
+## Model 1: Unadjusted Cox
+```{r}
+#set seed for output reproducibility
+set.seed(seed)
+
+#fit model
+model.1 <- coxph(
+  Surv(time, Delta) ~ A,
+  data = data.set,
+  robust = TRUE
+)
+
+#generate summary
+summary(model.1)
+```
+
+\newpage
+## Model 2: Unadjusted Case Base
+```{r}
+#set seed for output reproducibility
+set.seed(seed)
+
+#fit model
+model.2 <- fitSmoothHazard(
+  Delta ~ time * A,
+  data = data.set,
+  ratio = 10
+)
+
+#generate summary
+summary(model.2)
+
+#HR
+cat("HR-hat:", exp(-model.2$coefficients[3]))
+```
+
+
+\newpage
+## Model 3: Covariate Adjusted Cox
+```{r}
+#set seed for output reproducibility
+set.seed(seed)
+
+#fit model
+model.3 <- coxph(
+  Surv(time, Delta) ~ A +
+    Gender +
+    Age +
+    Weight +
+    Race +
+    Education +
+    Income +
+    InsuranceClass +
+    CHFhx +
+    CARDIOhx +
+    DEMENThx +
+    PSYCHhx +
+    CHRPULhx +
+    RENALhx +
+    LIVERhx +
+    GIBLEDhx +
+    MALIGhx +
+    IMMUNhx +
+    TRANShx +
+    AMIhx + 
+    Cancer + 
+    Category + 
+    Severity,
+  data = data.set,
+  robust = TRUE
+)
+
+#generate summary
+summary(model.3)
+```
+
+\newpage
+## Model 4: Covariate Adjusted Case Base
+```{r}
+#set seed for output reproducibility
+set.seed(seed)
+
+#fit model
+model.4 <- fitSmoothHazard(
+  Delta ~ time * A +
+    Gender +
+    Age +
+    Weight +
+    Race +
+    Education +
+    Income +
+    InsuranceClass +
+    CHFhx +
+    CARDIOhx +
+    DEMENThx +
+    PSYCHhx +
+    CHRPULhx +
+    RENALhx +
+    LIVERhx +
+    GIBLEDhx +
+    MALIGhx +
+    IMMUNhx +
+    TRANShx +
+    AMIhx + 
+    Cancer + 
+    Category + 
+    Severity,
+  data = data.set,
+  ratio = 10
+)
+
+#generate summary
+summary(model.4)
+
+#HR
+cat("HR-hat:", exp(-model.4$coefficients[3]))
+```
+
+\newpage
+## Model 5: Marginal Structural Cox
+```{r}
+#set seed for output reproducibility
+set.seed(seed)
+
+#fit model
+model.5 <- coxph(
+  Surv(time, Delta) ~ A,
+  data = data.set,
+  weights = ipw.stabilized,
+  robust = TRUE
+)
+
+#generate summary
+summary(model.5)
+```
+
+\newpage
+## Model 6: IPW Case Base PH
+```{r, message=FALSE}
+#set seed for output reproducibility
+set.seed(seed)
+
+#fit model
+model.6 <- fitSmoothHazard(
+  Delta ~ time * A,
+  data = data.set,
+  ratio = 10,
+  family = "glm",
+  weights = ipw.stabilized
+)
+
+#generate summary
+summary(model.6)
+
+#HR
+cat("HR-hat:", exp(-model.6$coefficients[3]))
+```
+
+\newpage
+## Model 7: IPW Case Base (Variable Hazard over Time)
+```{r, message=FALSE}
+#set seed for output reproducibility
+set.seed(seed)
+
+#fit model
+model.7 <- fitSmoothHazard(
+  Delta ~ pspline(time, df = 2) * A,
+  data = data.set,
+  ratio = 10,
+  weights = ipw.stabilized
+)
+
+#generate summary
+summary(model.7)
+
+#plot hazard-time
+plot.time <- seq(
+  min(data.set$time, na.rm = TRUE),
+  max(data.set$time, na.rm = TRUE),
+  by = 0.1
+)
+
+plot.data <- data.frame(
+  A = factor(
+    "No RHC",
+    levels = c("No RHC", "RHC")
+  ),
+  time = plot.time
+)
+
+plot(
+  model.7,
+  type = "hr",
+  newdata = plot.data,
+  var = "A",
+  xvar = "time",
+  ci = TRUE,
+  ylim = c(0,2)
+)
+```

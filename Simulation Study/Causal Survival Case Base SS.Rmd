@@ -1,0 +1,1653 @@
+---
+title: "Causal Survival Case Base SS v2"
+output: pdf_document
+date: "2026-07-07"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+\newpage
+# Imports
+```{r, warning=FALSE, message=FALSE}
+library("survival")
+library("casebase")
+library("sandwich")
+library("ggplot2")
+library("patchwork")
+library("gt")
+library("foreach")
+library("doParallel")
+library("doRNG")
+```
+
+\newpage
+# Functions
+
+## Data Generation
+```{r}
+generate.data = function(
+    n,
+    r,
+    l,
+    treatment.predictor.coefs,
+    intercept,
+    outcome.predictor.coefs,
+    beta.A,
+    censoring.limit,
+    constant.HR = TRUE,
+    shape = 1 
+  ) {
+  
+  # ---- Covariates (x1-x11) ----
+  X1 <- rnorm(n)
+  X2 <- rnorm(n)
+  X3 <- runif(n)
+  X4 <- runif(n)
+  X5 <- rlnorm(n)
+  X6 <- rlnorm(n)
+  X7 <- rexp(n, rate = r)
+  X8 <- rbinom(n, 1, 0.6)
+  X9 <- rbinom(n, 1, 0.4)
+  X10 <- rpois(n, lambda = l)
+  
+  X <- cbind(
+    X1, X2, X3, X4, X5,
+    X6, X7, X8, X9, X10
+  )
+  
+  # ---- DbC ----
+  stopifnot(length(treatment.predictor.coefs) == ncol(X))
+  stopifnot(length(outcome.predictor.coefs) == ncol(X))
+  stopifnot(all(is.finite(treatment.predictor.coefs)))
+  stopifnot(all(is.finite(outcome.predictor.coefs)))
+  
+  # ---- Treatment (confounded by all covariates) ----
+  weighted.covariates <- as.vector(X %*% treatment.predictor.coefs)
+  linear.predictor.A <- (intercept) + weighted.covariates
+  
+  A <- rbinom(n, 1, plogis(linear.predictor.A))
+
+  # ---- Outcome model (true causal effect of A) ----
+  weighted.covariates <- as.vector(X %*% outcome.predictor.coefs)  
+  C <- runif(n, 0, censoring.limit) # random censoring
+  
+  linear.predictor.Y <- -1 + weighted.covariates
+  
+  T.star <- numeric(n)
+  
+  if (constant.HR) {
+    
+    linear.predictor.Y <- linear.predictor.Y + (beta.A * A)
+    
+    T.star <- rweibull(
+      n,
+      shape = shape,
+      scale = exp(-linear.predictor.Y / shape)
+    ) 
+  
+  #time-dependent HR
+  } else {
+    # insert code for time dependent HR
+    linear.predictor.Y <- NULL
+    
+    T.star <- NULL
+  }
+  
+  time <- pmin(T.star, C) # observed event time 
+  Delta <- as.integer(T.star <= C) # event indicator
+  
+  # ---- Data Set Design ----
+  data_set <- data.frame(
+    time = as.numeric(time),
+    Delta = Delta,
+    A = A,
+    X
+  )
+  
+  return(data_set)
+}
+```
+
+\newpage
+## FSH: Modified Definition
+```{r}
+FSH <- function(
+    formula,
+    data,
+    time,
+    w = rep(1, nrow(data)),
+    ratio = 100, ...  
+  ) {
+  
+  cl <- match.call()
+  
+  formula <- expand.dot.formula(
+    formula,
+    data = data
+  )
+  
+  # Infer name of event variable from LHS of formula
+  eventVar <- all.vars(formula[[2]])
+
+  if (missing(time)) {
+    varNames <- checkArgsTimeEvent(
+      data = data,
+      event = eventVar
+    )
+    
+    timeVar <- varNames$time
+  
+  } else {
+    timeVar <- time
+  }
+
+  typeEvents <- sort(unique(data[[eventVar]]))
+  
+  # Call sampleCaseBase if class is not cbData
+  if (!inherits(data, "cbData")) {
+  
+    originalData <- as.data.frame(data)
+    originalData$w <- w
+    
+    sampleData <- sampleCaseBase(
+      originalData,
+      timeVar,
+      eventVar,
+      comprisk = (length(typeEvents) > 2),
+      ratio
+    )
+  
+  } else {
+    # If class is cbData we no longer have the original data
+    originalData <- data.frame() # Empty data.frame
+    sampleData <- data
+  }
+
+  formula <- update(formula, ~ . + offset(offset))
+
+  # Fit a binomial model because there are no competing risks
+  fittingFunction <- function(formula) glm(
+    formula,
+    data = sampleData,
+    family = binomial,
+    weights = w
+  )
+
+  out <- fittingFunction(formula)
+  
+  # Save lower call for plot method
+  out$lower_call <- out$call 
+  out$call <- cl
+  
+  out$originalData <- originalData
+  out$typeEvents <- typeEvents
+  out$timeVar <- timeVar
+  out$eventVar <- eventVar
+  
+  # Count person-moment types
+  num_pm <- table(sampleData[[eventVar]])
+  out$num_cm <- num_pm[2]
+  out$num_bm <- num_pm[1]
+  out$formula <- formula
+  
+  # Reset offset for absolute risk estimation, but keep track of it
+  out$offset <- out$data$offset
+  out$data$offset <- 0
+  
+  # Add new class
+  class(out) <- c("singleEventCB", class(out))
+  
+  return(out)
+}
+```
+
+\newpage
+## Expand Dot Formula
+```{r}
+expand.dot.formula <- function(formula, data = NULL) {
+  if (isTRUE("." %in% all.vars(formula))) {
+    att <- attributes(formula)
+    try.terms <- try(
+      stats::terms(formula, data = data),
+      silent = TRUE
+    )
+    if (!is(try.terms, "try-error")) {
+      formula <- formula(try.terms)
+    }
+    attributes(formula) <- att
+  }
+  formula
+}
+```
+
+\newpage
+## RMST
+```{r}
+rmst.fn <- function(time, surv) {
+  dt <- diff(time)
+  mids <- (head(surv, -1) + tail(surv, -1)) / 2
+  c(0, cumsum(mids * dt))
+}
+```
+
+\newpage
+## Refactor Data Structure
+```{r}
+refactor <- function(result) {
+  store.by.var <- lapply(names(result[[1]]), function(x)
+    sapply(result, `[[`, x)
+  )
+  names(store.by.var) <- names(result[[1]])
+  return(store.by.var)
+}
+```
+
+\newpage
+## Get Marginal Estimates
+```{r}
+get.marginal.estimates <- function(
+    r, l,
+    intercept,
+    outcome.predictor.coefs,
+    beta.A,
+    censoring.limit,
+    constant.HR
+  ) {
+  
+  # generate data
+  dat <- generate.data(
+    n                         = 10000000,
+    r                         = r,
+    l                         = l,
+    treatment.predictor.coefs = rep(0, 10),
+    intercept                 = intercept,
+    outcome.predictor.coefs   = outcome.predictor.coefs,
+    beta.A                    = beta.A,
+    censoring.limit           = censoring.limit,
+    constant.HR               = constant.HR
+  )
+  
+  # fit ms-cox model and extract psi
+  ms.cox <- NULL
+  psi <- NULL
+  
+  if (constant.HR) {
+    ms.cox <- coxph(
+      Surv(time, Delta) ~ A,
+      data = dat
+    )
+    psi <- coef(ms.cox)["A"]
+    
+  } else {
+    ms.cox <- coxph(
+      Surv(time, Delta) ~ A * time,
+      data = dat
+    )
+    psi <- NULL
+  }
+  
+  ## extract counter-factual ms.cox survival curves
+  sf.cox <- survfit(
+    ms.cox,
+    newdata = data.frame(A = c(0, 1))
+  )
+  
+  s0.cox <- approx(
+    sf.cox$time,
+    sf.cox$surv[, 1],
+    xout   = t.grid,
+    method = "constant",
+    rule   = 2
+  )$y
+  
+  s1.cox <- approx(
+    sf.cox$time,
+    sf.cox$surv[, 2],
+    xout   = t.grid,
+    method = "constant",
+    rule   = 2
+  )$y
+  
+  # create output object
+  output <- list(
+    psi  = psi,
+    rmst = rmst.fn(t.grid, s1.cox) - rmst.fn(t.grid, s0.cox)
+  )
+  
+  return(output)
+}
+```
+
+\newpage
+## Intermediate Step
+```{r}
+intermediate.step <- function(
+    r, l, 
+    intercept,
+    outcome.predictor.coefs,
+    beta.A,
+    censoring.limit,
+    constant.HR
+  ) {
+
+  cl <- parallel::makeCluster(2)
+  doParallel::registerDoParallel(cl)
+  on.exit(parallel::stopCluster(cl), add = TRUE)
+
+  result <- foreach(
+    i = 1:100,
+    .packages = "survival",
+    .export = c(
+      "generate.data",
+      "get.marginal.estimates",
+      "t.grid", "rmst.fn"
+    ),
+    .options.RNG = seed
+  ) %dorng% {
+    get.marginal.estimates(
+      r, l,
+      intercept,
+      outcome.predictor.coefs,
+      beta.A,
+      censoring.limit,
+      constant.HR
+    )
+  }
+  
+  #refactor the results to efficiently store them then return
+  return(refactor(result))
+}
+```
+
+\newpage
+## MS-Cox RMST SE
+```{r}
+cox.rmst.list <- function(
+    ms.cox, t.grid, cox.psi.se, survival.curves.data 
+  ) {
+  
+  # calculate counter-factual survival curves
+  sf <- survfit(
+    ms.cox,
+    newdata = survival.curves.data
+  )
+  
+  S0 <- approx(
+    sf$time,
+    sf$surv[, 1],
+    t.grid,
+    method = "constant",
+    rule = 2
+  )$y
+  
+  S1 <- approx(
+    sf$time,
+    sf$surv[, 2],
+    t.grid,
+    method = "constant",
+    rule = 2
+  )$y
+  
+  # point estimate
+  cox.rmst <- rmst.fn(t.grid, S1) - rmst.fn(t.grid, S0)
+  
+  # delta-method gradient: g = int_0^tau S1 * log(S1) dt
+  integrand <- ifelse(S1 > 0, S1 * log(S1), 0)
+  g.cox <- rmst.fn(t.grid, integrand)
+  cox.rmst.se <- abs(g.cox) * cox.psi.se
+  
+  return(list(
+    cox.rmst = cox.rmst,
+    cox.rmst.se = cox.rmst.se
+  ))
+}
+```
+
+\newpage
+## Case Base RMST SE
+```{r}
+cb.rmst.list <- function(cb.ipw, cb.var, t.grid, constant.HR) {
+  beta.hat  <- coef(cb.ipw)
+  term.form <- delete.response(terms(cb.ipw))
+ 
+  # survival S^{(a)}(t) built from the model's own design matrix
+  cb.surv <- function(beta, a, grid) {
+    nd <- data.frame(
+      time = grid,
+      A = a,
+      offset = 0
+    )
+    
+    X   <- model.matrix(term.form, data = nd)     # matches beta by construction
+    X   <- X[, names(beta), drop = FALSE]         # align columns to coef order
+    
+    lambda <- exp(as.vector(X %*% beta))
+    Lambda <- c(
+      0,
+      cumsum(
+        diff(grid) * (head(lambda, -1) + tail(lambda, -1)) / 2
+      )
+    )
+    exp(-Lambda)
+  }
+
+  rmst.diff <- function(beta) {
+    rmst.fn(t.grid, cb.surv(beta, 1, t.grid)) -
+    rmst.fn(t.grid, cb.surv(beta, 0, t.grid))
+  }
+  
+  # calculate rmst
+  cb.rmst <- rmst.diff(beta.hat)
+  
+  # numerical gradient of the RMST contrast wrt beta
+  p <- length(beta.hat)
+  m <- length(t.grid)
+  
+  grad <- matrix(NA_real_, nrow = m, ncol = p)
+  colnames(grad) <- names(beta.hat)
+  eps <- 1e-6
+  
+  for (j in seq_len(p)) {
+    bp <- bm <- beta.hat
+    bp[j] <- bp[j] + eps
+    bm[j] <- bm[j] - eps
+  
+    grad[, j] <- (rmst.diff(bp) - rmst.diff(bm)) / (2 * eps)
+  }
+
+  # align covariance to the gradient names, then apply the delta method
+  cb.var <- cb.var[colnames(grad), colnames(grad), drop = FALSE]
+  cb.rmst.se <- vapply(
+    seq_len(m),
+    function(i) {
+      g <- grad[i, ]
+      sqrt(drop(t(g) %*% cb.var %*% g))
+    },
+    numeric(1)
+  )
+  
+  return(list(
+    cb.rmst = cb.rmst,
+    cb.rmst.se = cb.rmst.se
+  ))
+}
+```
+
+\newpage
+## Run One Simulation
+```{r}
+run.one.sim <- function(
+    n, r, l,
+    treatment.predictor.coefs,
+    intercept,
+    outcome.predictor.coefs,
+    beta.A,
+    censoring.limit,
+    constant.HR,
+    i  
+  ) {
+
+  # generate data
+  data.set <- generate.data(
+      n                         = n,
+      r                         = r,
+      l                         = l,
+      treatment.predictor.coefs = treatment.predictor.coefs,
+      intercept                 = intercept,
+      outcome.predictor.coefs   = outcome.predictor.coefs,
+      beta.A                    = beta.A,
+      censoring.limit           = censoring.limit,
+      constant.HR               = constant.HR
+  )
+
+  # calculate propensity scores
+  p.score <- fitted(
+    glm(
+      A ~ X1 + X2 + X3 + X4 + X5 +
+        X6 + X7 + X8 + X9 + X10,
+      data = data.set,
+      family = binomial(link = "logit")
+    )
+  )
+  
+  A <- data.set$A
+
+  p.A1 <- mean(A)
+  
+  # calculate stabilized ipws
+  ipw.stabilized <- ifelse(
+    A == 1,
+    p.A1 / p.score,
+    (1 - p.A1) / (1 - p.score)
+  )
+  
+  # cox model
+  ms.cox <- NULL
+  cox.psi <- NULL
+  cox.psi.se <- NULL
+  
+  if (constant.HR) {
+    ms.cox <- coxph(
+      Surv(time, Delta) ~ A,
+      data = data.set,
+      weights = ipw.stabilized,
+      robust = TRUE
+    )
+    ## extract hr and hr.se
+    cox.psi <- coef(ms.cox)["A"]           
+    cox.psi.se <- sqrt(diag(vcov(ms.cox))["A"])
+    
+  } else { # variable HR
+    ms.cox <- coxph(
+      Surv(time, Delta) ~ A * time,
+      data = data.set,
+      weights = ipw.stabilized,
+      robust = TRUE
+    )
+    ## extract hr and hr.se
+    cox.psi <- NULL
+    cox.psi.se <- NULL
+  }
+  
+  ## extract counterfactual ms.cox survival curves
+  survival.curves.data <- data.frame(A = c(0, 1))
+  
+  ## calculate rmst and rmst.se
+  cox.rmst.list <- cox.rmst.list(
+    ms.cox = ms.cox,
+    t.grid = t.grid,
+    cox.psi.se = cox.psi.se,
+    survival.curves.data = survival.curves.data
+  )
+  
+  cox.rmst <- cox.rmst.list$cox.rmst
+  cox.rmst.se <- cox.rmst.list$cox.rmst.se
+
+  # case-base model
+  fsh.ratio <- 100
+  
+  ## fit cb model
+  cb.ipw <- NULL
+  cb.psi <- NULL
+  cb.psi.se <- NULL
+  cb.var <- NULL
+  
+  if (constant.HR) {
+    cb.ipw <- FSH(
+      Delta ~ A,
+      data = data.set,
+      ratio = fsh.ratio,
+      w = ipw.stabilized
+    )
+    ## extract psi and psi.se
+    cb.psi <- coef(cb.ipw)["A"]
+    cb.var <- vcovHC(cb.ipw, type = "HC0")
+    cb.psi.se <- sqrt(diag(cb.var)["A"])
+    
+  } else {
+    cb.ipw <- FSH(
+      Delta ~ A * pspline(time, df = 4),
+      data = data.set,
+      ratio = fsh.ratio,
+      w = ipw.stabilized
+    )
+    ## extract psi and psi.se
+    cb.psi <- NULL
+    cb.psi.se <- NULL
+    cb.var <- NULL
+  }
+  
+  ## calculate rmst and rmst.se
+  cb.rmst.list <- cb.rmst.list(
+    cb.ipw, cb.var, t.grid, constant.HR
+  )
+  
+  cb.rmst <- cb.rmst.list$cb.rmst
+  cb.rmst.se <- cb.rmst.list$cb.rmst.se
+  
+  
+  output <- list(
+    simulation.number = i,
+    cox.psi = cox.psi,
+    cox.psi.se = cox.psi.se,
+    cb.psi = cb.psi,
+    cb.psi.se = cb.psi.se,
+    cox.rmst = cox.rmst,
+    cox.rmst.se = cox.rmst.se,
+    cb.rmst = cb.rmst,
+    cb.rmst.se = cb.rmst.se
+  )
+  
+  return(output)
+}
+```
+
+\newpage
+## Simulate
+```{r}
+simulate = function(
+      n, r, l,
+      treatment.predictor.coefs,
+      intercept,
+      outcome.predictor.coefs,
+      beta.A,
+      censoring.limit,
+      constant.HR
+  ) {
+  
+  # setup for parallel processing
+  n.cores <- round(parallel::detectCores() * 0.6)
+  cl <- parallel::makeCluster(n.cores)
+  doParallel::registerDoParallel(cl)
+  on.exit(parallel::stopCluster(cl), add = TRUE)
+  
+  # run the simulations
+  result <- foreach(
+    i = 1:1000,
+    .packages = c("survival", "casebase"),
+    .export = c(
+      "run.one.sim",
+      "generate.data",
+      "vcovHC", "vcov",
+      "FSH", "expand.dot.formula",
+      "t.grid", "rmst.fn",
+      "cox.rmst.list",
+      "cb.rmst.list",
+      "shape"
+    ),
+    .options.RNG = seed
+  ) %dorng% {
+    run.one.sim(
+      n, r, l,
+      treatment.predictor.coefs,
+      intercept,
+      outcome.predictor.coefs,
+      beta.A,
+      censoring.limit,
+      constant.HR,
+      i
+    )
+  }
+  
+  #refactor the results to efficiently store them
+  return(refactor(result))
+}
+```
+
+\newpage
+## Plot Multiple RMST
+```{r}
+plot.multiple.rmst <- function(titles, rmst.list, cols, main.title = "") {
+  
+  num.types <- length(rmst.list)
+  
+  if (main.title == "") {
+    main.title <- paste(titles[1], "RMST")
+    if (num.types > 1) {
+      main.title <- "RMST Comparison"
+    } 
+  }
+  
+  if (
+    num.types == length(titles) &&
+    num.types == length(cols) &&
+    num.types > 0 &&
+    num.types <= 5
+  ) {
+    
+    avg.last.point <- mean(rmst.list[[1]][-nrow(rmst.list[[1]])])
+    legend.placement <- "topright"
+    
+    if (avg.last.point < -0.3) {
+      ylim <- c(min(rmst.list[[1]][-nrow(rmst.list[[1]])]), 0)
+      legend.placement <- "bottomleft"
+    
+    } else if (avg.last.point > 0.3) {
+      ylim <- c(0, max(rmst.list[[1]][-nrow(rmst.list[[1]])]))
+    
+    } else {
+      ylim <- c(
+        min(rmst.list[[1]][-nrow(rmst.list[[1]])]),
+        max(rmst.list[[1]][-nrow(rmst.list[[1]])])
+      )
+    }
+    
+    alpha.cols <- adjustcolor(cols, alpha.f = 0.05)
+    
+    # First plot
+    matplot(
+      t.grid,
+      rmst.list[[1]],
+      type = "l",
+      lty = 1,
+      col = alpha.cols[1],
+      xlab = "Time",
+      ylab = "RMST",
+      main = main.title
+    )
+    
+    # Add remaining curves
+    if (length(rmst.list) > 1) {
+      for (i in 2:num.types) {
+        matplot(
+          t.grid,
+          rmst.list[[i]],
+          type = "l",
+          lty = 1,
+          col = alpha.cols[i],
+          add = TRUE
+        )
+      }
+    }
+    
+    abline(h = 0, col = "black", lwd = 3, lty = 2)
+    
+    legend(
+      legend.placement,
+      legend = titles,
+      col = cols[1:num.types],
+      lwd = 2,
+      lty = 1
+    ) 
+  } else {
+    cat("error")
+    if (length(titles) != num.types) {
+      cat("mismatch")
+    }
+  }
+}
+```
+
+\newpage
+## Plot All RMST
+```{r}
+plot.all.rmst <- function(true.rmst, cox.rmst, cb.rmst, save.plots = FALSE) {
+  # plot only true rmst
+  if (save.plots) {
+    pdf("true-rmst.pdf", width = 8, height = 5)
+  }
+  plot.multiple.rmst(
+    titles = c("Marginal"),
+    rmst.list = list(true.rmst),
+    cols = "purple"
+  )
+  if (save.plots) {
+    dev.off()
+  }
+  
+  # plot cox.rmst with true rmst
+  if (save.plots) {
+    pdf("cox-rmst.pdf", width = 8, height = 5)
+  }
+  plot.multiple.rmst(
+    titles = c(
+      "MS-Cox",
+      "Marginal"
+    ),
+    rmst.list = list(
+      cox.rmst,
+      true.rmst
+    ),
+    cols = c(
+      "red",
+      "black"
+    ),
+    main.title = "MS-Cox RMST"
+  )
+  if (save.plots) {
+    dev.off()
+  }
+  
+  # plot cb.rmst with true rmst
+  if (save.plots) {
+    pdf("cb-rmst.pdf", width = 8, height = 5)
+  }
+  plot.multiple.rmst(
+    titles = c(
+      "Case Base",
+      "Marginal"
+    ),
+    rmst.list = list(
+      cb.rmst,
+      true.rmst
+    ),
+    cols = c(
+      "blue",
+      "black"
+    ),
+    main.title = "Case Base RMST"
+  )
+  if (save.plots) {
+    dev.off()
+  }
+  
+  # plot rmst comparison
+  if (save.plots) {
+    pdf("all-rmst.pdf", width = 8, height = 5)
+  }
+  plot.multiple.rmst(
+    titles = c(
+      "MS-Cox", 
+      "Case Base",
+      "Marginal"
+    ),
+    rmst.list = list(
+      cox.rmst,
+      cb.rmst,
+      true.rmst
+    ),
+    cols = c(
+      "red",
+      "blue",
+      "black"
+    )
+  )
+  if (save.plots) {
+    dev.off()
+  }
+}
+```
+
+\newpage
+## RMST Summary
+```{r}
+get.rmst.summary <- function(
+    tau.points,
+    rmst.matrix,
+    rmst.se.matrix,
+    marginal.rmst.means,
+    alpha = 0.05
+) {
+
+  n <- ncol(rmst.matrix)
+  z <- qnorm(1 - alpha / 2)
+
+  ## Mean
+  rmst.means <- rowMeans(
+    rmst.matrix[tau.points, ]
+  )
+
+  ## Empirical SD
+  rmst.sd <- apply(
+    rmst.matrix[tau.points, ],
+    1,
+    sd
+  )
+
+  ## Mean estimated SE
+  rmst.se.mean <- rowMeans(
+    rmst.se.matrix[tau.points, ]
+  )
+
+  ## Bias
+  rmst.biases <- rmst.means - marginal.rmst.means
+
+  ## Bias MCSE
+  rmst.bias.mcse <- rmst.sd / sqrt(n)
+
+  ## RMSE
+  rmst.rmse <- sqrt(
+    rowMeans(
+      (rmst.matrix[tau.points, ] - marginal.rmst.means)^2
+    )
+  )
+
+  ## Coverage
+  lower <- rmst.matrix[tau.points, ] -
+    z * rmst.se.matrix[tau.points, ]
+
+  upper <- rmst.matrix[tau.points, ] +
+    z * rmst.se.matrix[tau.points, ]
+
+  coverage <- rowMeans(
+    lower <= marginal.rmst.means &
+    upper >= marginal.rmst.means
+  )
+
+  ## Coverage MCSE
+  coverage.mcse <- sqrt(
+    coverage * (1 - coverage) / n
+  )
+
+  ## Store results
+  k <- length(tau.points)
+
+  rmst.summary <- matrix(NA_real_, nrow = k, ncol = 8)
+  colnames(rmst.summary) <- c(
+    "mean",
+    "sd",
+    "se.mean",
+    "bias",
+    "bias.mcse",
+    "rmse",
+    "coverage",
+    "coverage.mcse"
+  )
+
+  rmst.summary[, "mean"] <- rmst.means
+  rmst.summary[, "sd"] <- rmst.sd
+  rmst.summary[, "se.mean"] <- rmst.se.mean
+  rmst.summary[, "bias"] <- rmst.biases
+  rmst.summary[, "bias.mcse"] <- rmst.bias.mcse
+  rmst.summary[, "rmse"] <- rmst.rmse
+  rmst.summary[, "coverage"] <- coverage
+  rmst.summary[, "coverage.mcse"] <- coverage.mcse
+
+  return(rmst.summary)
+}
+```
+
+\newpage
+## Output RMST Statistics Summary
+```{r}
+print.rmst.summary <- function(rmst.summary, tau.values, model) {
+
+  cat("\n========================================\n")
+  cat(model, "\n")
+  cat("========================================\n")
+
+  cat("\nRestricted Mean Survival Time Summary\n")
+  cat("----------------------------------------\n")
+  
+  for (i in seq_along(tau.values)) {
+
+    cat("\nTau =", tau.values[i], "\n")
+    cat("----------------------------------------\n")
+
+    cat("Mean RMST:", rmst.summary[i, "mean"], "\n")
+    cat("Bias:", rmst.summary[i, "bias"],
+        " | MC-SE:", rmst.summary[i, "bias.mcse"], "\n")
+    cat("RMSE:", rmst.summary[i, "rmse"], "\n")
+    cat("Mean Estimated SE:", rmst.summary[i, "se.mean"],
+        " | Empirical SD:", rmst.summary[i, "sd"], "\n")
+    cat("Coverage:", rmst.summary[i, "coverage"],
+        " | MC-SE:", rmst.summary[i, "coverage.mcse"], "\n")
+  }
+
+  cat("\n")
+}
+```
+
+\newpage
+## Output True RMST
+```{r}
+print.true.rmst <- function(true.rmst, tau.points, tau.values) {
+  cat("\n========================================\n")
+  cat("\nTrue Mean Restricted Mean Survival Time\n")
+  cat("========================================\n")
+  
+  for (i in seq_along(tau.values)) {
+    cat(tau.values[i], ":", mean(true.rmst[tau.points[i], ]), "\n")
+  }
+  cat("\n")
+}
+```
+
+\newpage
+## Plot HR
+```{r}
+plot.hr <- function(true.hr, cox.hr, cb.hr, save.plot = FALSE) {
+  
+  if (save.plot) {
+    pdf("hr.pdf", width = 8, height = 5)
+  }
+  
+  hist(
+    cox.hr,
+    breaks = 50,
+    col = rgb(1, 0, 0, 0.5),   # semi-transparent red
+    border = "red",
+    xlab = "Hazard Ratio",
+    main = "Hazard Ratio Comparison"
+  )
+  
+  hist(
+    cb.hr,
+    breaks = 50,
+    col = rgb(0, 0, 1, 0.5),   # semi-transparent blue
+    border = "blue",
+    add = TRUE
+  )
+  
+  abline(v = true.hr, col = "black", lwd = 3, lty = 2)
+  
+  legend(
+    "topright",
+    legend = c("MS-Cox HR", "Case Base HR", "True HR"),
+    fill = c(rgb(1, 0, 0, 0.5), rgb(0, 0, 1, 0.5), NA),
+    border = c("red", "blue", NA),
+    lty = c(NA, NA, 2),
+    lwd = c(NA, NA, 3),
+    col = c(NA, NA, "black")
+  )
+  
+  if (save.plot) {
+    dev.off()
+  }
+}
+```
+
+\newpage
+## Plot HR Errors
+```{r}
+plot.hr.errors <- function(true.hr, cox.hr, cb.hr, save.plot = FALSE) {
+  cox.hr.error <- cox.hr - true.hr
+  cb.hr.error <- cb.hr - true.hr
+  
+  if (save.plot) {
+    pdf("hr-errors.pdf", width = 8, height = 5)
+  }
+  
+  hist(
+    cox.hr.error,
+    breaks = 50,
+    col = rgb(1, 0, 0, 0.5),   # semi-transparent red
+    border = "red",
+    xlab = "HR Errors",
+    main = "HR Errors Comparison"
+  )
+  
+  hist(
+    cb.hr.error,
+    breaks = 50,
+    col = rgb(0, 0, 1, 0.5),   # semi-transparent blue
+    border = "blue",
+    add = TRUE
+  )
+  
+  abline(v = 0, col = "black", lwd = 3, lty = 2)
+  
+  legend(
+    "topleft",
+    legend = c("MS-Cox HR Error", "Case Base HR Error"),
+    fill = c(rgb(1, 0, 0, 0.5), rgb(0, 0, 1, 0.5)),
+    border = c("red", "blue")
+  )
+  
+  if (save.plot) {
+    dev.off()
+  }
+}
+```
+
+\newpage
+## HR Summary
+```{r}
+get.hr.summary <- function(
+    true.hr,
+    psi.vector,
+    se.vector,
+    alpha = 0.05,
+    power = TRUE
+  ) {
+  n <- length(psi.vector)
+  z <- qnorm(1 - alpha / 2)
+  hr.vector <- exp(psi.vector)
+  
+  hr.mean <- exp(mean(psi.vector))
+  hr.emp.sd <- sd(hr.vector)
+  hr.bias <- hr.mean - true.hr
+  hr.bias.mcse <- hr.emp.sd  / sqrt(n)
+  hr.mse <- mean((hr.vector - true.hr)^2)
+  hr.rmse <- sqrt(hr.mse)
+  hr.se.mean <- mean(se.vector)
+  hr.ci.lower <- exp(psi.vector - z * se.vector)
+  hr.ci.upper <- exp(psi.vector + z * se.vector)
+  t1.error.or.power <- mean(hr.ci.lower > 1 | hr.ci.upper < 1)
+  hr.coverage <- mean(hr.ci.lower <= true.hr & true.hr <= hr.ci.upper)
+  hr.coverage.mcse <- sqrt(hr.coverage * (1 - hr.coverage) / n)
+
+  # store in a list
+  results <- list(
+    summary = c(
+      mean               = hr.mean,
+      emp.sd             = hr.emp.sd,
+      bias               = hr.bias,
+      bias.mcse          = hr.bias.mcse,
+      mse                = hr.mse,
+      rmse               = hr.rmse,
+      se.mean            = hr.se.mean,
+      t1.error.or.power  = t1.error.or.power,
+      coverage           = hr.coverage,
+      coverage.mcse      = hr.coverage.mcse
+    ),
+    ci = cbind(
+      lower = hr.ci.lower,
+      upper = hr.ci.upper
+    )
+  ) 
+  
+  return(results)
+}
+```
+
+## Output HR Statistics Summary
+```{r}
+print.hr.summary <- function(hr.stats.summary, model) {
+
+  cat("\n========================================\n")
+  cat(model, "\n")
+  cat("========================================\n")
+
+  cat("\nHazard Ratio Summary\n")
+  cat("----------------------------------------\n")
+
+  cat("Mean HR:", hr.stats.summary["mean"], "\n")
+  cat("Bias:", hr.stats.summary["bias"],
+      " | MC-SE:", hr.stats.summary["bias.mcse"], "\n")
+  cat("MSE:", hr.stats.summary["mse"], "\n")
+  cat("RMSE:", hr.stats.summary["rmse"], "\n")
+  cat("Mean Estimated SE:", hr.stats.summary["se.mean"],
+      " | Empirical SD:", hr.stats.summary["emp.sd"], "\n")
+  cat("Type I Error/Power:", hr.stats.summary["t1.error.or.power"], "\n")
+  cat("Coverage:", hr.stats.summary["coverage"],
+      " | MC-SE:", hr.stats.summary["coverage.mcse"], "\n")
+
+  cat("\n")
+}
+```
+
+\newpage
+## Output True HR
+```{r}
+print.true.hr <- function(true.hr) {
+  cat("\n========================================\n")
+  cat("True HR:", true.hr, "\n")
+  cat("========================================\n")
+}
+```
+
+\newpage
+## Summarize and Print HR Statistics
+```{r}
+summarize.print.hr <- function(
+    true.hr,
+    cox.psi, cox.psi.se,
+    cb.psi, cb.psi.se  
+  ) {
+  
+  cox.psi.stats <- get.hr.summary(
+    true.hr,
+    cox.psi,
+    cox.psi.se
+  )
+  
+  cb.psi.stats <- get.hr.summary(
+    true.hr,
+    cb.psi,
+    cb.psi.se
+  )
+  
+  print.hr.summary(
+    cox.psi.stats$summary,
+    "MS-Cox"
+  )
+  print.hr.summary(
+    cb.psi.stats$summary,
+    "Case Base"
+  )
+  
+  return(list(
+    cox.psi.stats,
+    cb.psi.stats
+  ))
+}
+```
+
+\newpage
+## Plot HR CI
+```{r}
+plot.hr.ci <- function(
+    true.value,
+    title,
+    ci.list,
+    hr.list,
+    colour = "red",
+    coverage = 0,
+    seed = 123
+  ) {
+    
+  set.seed(seed)
+  x = 1:100
+  sampled.indices <- sample(1:length(hr.list), 100)
+  
+  plot <- ggplot() +
+    geom_ribbon(
+      aes(
+        x = x,
+        ymin = ci.list[[1]][sampled.indices],
+        ymax = ci.list[[2]][sampled.indices]
+      ),
+      fill = colour,
+      alpha = 0.5,
+      show.legend = FALSE
+    ) +
+    geom_line(
+      aes(
+        x = x, 
+        y = hr.list[sampled.indices], 
+        colour = title 
+      )
+    ) +
+    geom_hline(
+      aes(
+        yintercept = true.value,
+        colour = "True HR",
+        linetype = "True HR"
+      )
+    ) +
+    geom_hline(
+      aes(
+        yintercept = 1,
+        colour = "Null value",
+        linetype = "Null value"
+      )
+    ) +
+    scale_colour_manual(
+      name = "",
+      values = c(
+        setNames(colour, title),
+        "True HR" = "black",
+        "Null value" = "purple"
+      )
+    ) +
+    scale_linetype_manual(
+      name = "",
+      values = c(
+        title = "solid",
+        "True HR" = "dashed",
+        "Null value" = "dotted"
+      )
+    ) +
+    labs(
+      x = "Simulation",
+      y = "Hazard ratio",
+      title = paste(title, "HR Confidence Intervals - Coverage:", coverage)
+    ) +
+    theme_bw()
+  
+  return(plot)
+}
+```
+
+\newpage
+## Plot All HR CIs
+```{r}
+plot.all.hr.ci <- function(
+    true.hr,
+    cox.hr, cox.hr.stats,
+    cb.hr, cb.hr.stats,
+    seed = 123,
+    save.plot = FALSE
+  ) {
+  
+  cox.hr.ci.plot <- plot.hr.ci(
+    true.hr, 
+    title = "MS-Cox",
+    list(
+      cox.hr.stats$ci[, "lower"],
+      cox.hr.stats$ci[, "upper"]
+    ),
+    cox.hr,
+    colour = "red",
+    coverage = cox.hr.stats$summary["coverage"],
+    seed = seed
+  )
+  
+  cb.hr.ci.plot <- plot.hr.ci(
+    true.hr, 
+    title = "Case Base",
+    list(
+      cb.hr.stats$ci[, "lower"],
+      cb.hr.stats$ci[, "upper"]
+    ),
+    cb.hr,
+    colour = "blue",
+    coverage = cb.hr.stats$summary["coverage"],
+    seed = seed
+  )
+  
+  combined_plot <- (cox.hr.ci.plot / cb.hr.ci.plot) +
+  plot_layout(guides = "collect")
+
+  if (save.plot) {
+    ggsave(
+      "hr-ci.pdf",
+      combined_plot,
+      width = 8,
+      height = 8
+    )
+  }
+}
+```
+
+\newpage
+## Run a complete Simulation Study Function
+```{r}
+run.complete.ss <- function(
+    n,
+    beta.A,
+    censoring.limit,
+    marginal.estimates,
+    generate.plots = FALSE,
+    save.plots = FALSE
+  ) {
+  
+  need.plots <- generate.plots || save.plots
+  
+  ## Run the simulation study
+  ss.out <- simulate(
+    n, r, l,
+    treatment.predictor.coefs,
+    intercept,
+    outcome.predictor.coefs,
+    beta.A,
+    censoring.limit,
+    constant.HR
+  )
+  
+  ## Restricted Mean Survival Time (RMST)
+  
+  if (need.plots) {
+    ### All RMST Plots
+    plot.all.rmst(
+      marginal.estimates$rmst,
+      ss.out$cox.rmst,
+      ss.out$cb.rmst,
+      save.plots = save.plots
+    )
+  }
+  
+  ### Summarize RMST Statistics
+  tau.points <- which(
+    (t.grid != 0) &
+    (t.grid == floor(t.grid))
+  )
+  
+  marginal.rmst.means <- rowMeans(
+    marginal.estimates$rmst[tau.points, ]
+  )
+  marginal.rmst.sd <- apply(
+    marginal.estimates$rmst[tau.points, ],
+    1, sd
+  )
+  
+  cox.rmst.summary <- get.rmst.summary(
+    tau.points,
+    ss.out$cox.rmst,
+    ss.out$cox.rmst.se,
+    marginal.rmst.means
+  )
+  
+  cb.rmst.summary <- get.rmst.summary(
+    tau.points,
+    ss.out$cb.rmst,
+    ss.out$cb.rmst.se,
+    marginal.rmst.means
+  )
+  
+  tau.values <- seq(1, 4, by = 1)
+  
+  print.true.rmst(
+    marginal.estimates$rmst,
+    tau.points,
+    tau.values
+  )
+  
+  print.rmst.summary(
+    cox.rmst.summary,
+    tau.values,
+    "MS-Cox RMST"
+  )
+  
+  print.rmst.summary(
+    cb.rmst.summary,
+    tau.values,
+    "Case Base RMST"
+  )
+  
+  ## Hazard Ratio (HR)
+  
+  ### Extract the True HR
+  true.hr <- exp(mean(marginal.estimates$psi))
+  
+  if (need.plots) {
+    ### Plot the distribution of the True HR
+    if (save.plots) {
+      pdf("true-hr.pdf", width = 8, height = 5)
+    }
+    hist(
+      exp(marginal.estimates$psi),
+      breaks = 30,
+      xlab = "HR",
+      main = "Marginal HR"
+    )
+    if (save.plots) {
+      dev.off()
+    }
+    
+    ### Visualize the Hazard Ratios
+    plot.hr(
+      true.hr,
+      exp(ss.out$cox.psi),
+      exp(ss.out$cb.psi),
+      save.plot = save.plots
+    )
+    
+    ### Visualize the Hazard Ratio Errors
+    plot.hr.errors(
+      true.hr,
+      exp(ss.out$cox.psi),
+      exp(ss.out$cb.psi),
+      save.plot = save.plots
+    )
+  }
+  
+  print.true.hr(true.hr)
+  
+  ### Summarize and Print HR Statistics
+  all.hr.stats <- summarize.print.hr(
+    true.hr,
+    ss.out$cox.psi, ss.out$cox.psi.se,
+    ss.out$cb.psi, ss.out$cb.psi.se
+  )
+  
+  if (need.plots) {
+    ### Plot All HR CIs
+    plot.all.hr.ci(
+      true.hr,
+      exp(ss.out$cox.psi), all.hr.stats[[1]],
+      exp(ss.out$cb.psi), all.hr.stats[[2]],
+      seed = seed,
+      save.plot = save.plots
+    )
+  }
+}
+```
+
+
+\newpage
+# Simulation Study
+
+## Data Generation Parameters
+```{r}
+seed <- 123
+
+tau.max <- 4
+t.grid <- seq(0, tau.max, by = 0.1)
+
+r = 2
+l = 1.5
+
+treatment.predictor.coefs <- c(
+  0.7,  -0.4,  0.5,  0.2, 0.6,
+  -0.3,  0.1,  -0.2, 0.4, -0.5
+)
+
+outcome.predictor.coefs <- c(
+  0.6,  -0.3,  0.4,  0.1, 0.5,
+  -0.2,  0.05,  -0.1, 0.3, -0.4
+)
+
+intercept <- 0.3
+constant.HR <- TRUE
+shape = 1
+```
+
+\newpage
+### Setting 1: beta.A = 0, n = 1000 (Null)
+```{r}
+n1 = 1000
+beta.A1 <- 0
+censoring.limit.1 <- 5
+```
+
+### Setting 2: beta.A = 1, n = 1000 (Strong)
+```{r}
+n2 = 1000
+beta.A2 <- 1
+censoring.limit.2 <- 5
+```
+
+### Setting 3: beta.A = 0.5, n = 1000 (Moderate)
+```{r}
+n3 = 1000
+beta.A3 <- 0.5
+censoring.limit.3 <- 5
+```
+
+### Setting 4: beta.A = 0.5, n = 500 (Moderate)
+```{r}
+n4 = 500
+beta.A4 <- 0.5
+censoring.limit.4 <- 5
+```
+
+### Setting 5: beta.A = 0.5, n = 250 (Moderate)
+```{r}
+n5 = 250
+beta.A5 <- 0.5
+censoring.limit.5 <- 5
+```
+
+### Setting 6: beta.A = 0.5, n = 1000 (Heavy Censoring)
+```{r}
+n6 = 1000
+beta.A6 <- 0.5
+censoring.limit.6 <- 3
+```
+
+\newpage
+# Extract the marginal estimates for all settings
+
+## Moderate Beta
+```{r, cache=TRUE}
+true.estimates.moderate <- intermediate.step(
+  r, l, 
+  intercept,
+  outcome.predictor.coefs,
+  beta.A3,
+  censoring.limit.1,
+  constant.HR
+)
+```
+
+## Null Beta
+```{r, cache=TRUE}
+true.estimates.null <- intermediate.step(
+  r, l, 
+  intercept,
+  outcome.predictor.coefs,
+  beta.A1,
+  censoring.limit.1,
+  constant.HR
+)
+```
+
+## Strong Beta
+```{r, cache=TRUE}
+true.estimates.strong <- intermediate.step(
+  r, l, 
+  intercept,
+  outcome.predictor.coefs,
+  beta.A2,
+  censoring.limit.1,
+  constant.HR
+)
+```
+
+\newpage
+# Time Dependent HR Settings
+## Monotone Inc/Dec Linear
+## Monotone Inc/Dec Quadratic
+## Quadratic Both Inc/Dec
+## Weibull
+## Gompertz
+
+\newpage
+# Run Simulation Study: Setting 1
+```{r}
+run.complete.ss(
+  n1, beta.A1,
+  censoring.limit.1,
+  true.estimates.null,
+  generate.plots = TRUE
+)
+```
+
+\newpage
+# Run Simulation Study: Setting 2
+```{r}
+run.complete.ss(
+  n2, beta.A2,
+  censoring.limit.2,
+  true.estimates.strong,
+  generate.plots = TRUE
+)
+```
+
+\newpage
+# Run Simulation Study: Setting 3
+```{r}
+run.complete.ss(
+  n3, beta.A3, 
+  censoring.limit.3, 
+  true.estimates.moderate, 
+  generate.plots = TRUE
+)
+```
+
+\newpage
+# Run Simulation Study: Setting 4
+```{r}
+run.complete.ss(
+  n4, beta.A4,
+  censoring.limit.4,
+  true.estimates.moderate,
+  generate.plots = TRUE
+)
+```
+
+\newpage
+# Run Simulation Study: Setting 5
+```{r}
+run.complete.ss(
+  n5, beta.A5,
+  censoring.limit.5,
+  true.estimates.moderate,
+  generate.plots = TRUE
+)
+```
+
+\newpage
+# Run Simulation Study: Setting 6
+```{r}
+run.complete.ss(
+  n6, beta.A6,
+  censoring.limit.6,
+  true.estimates.moderate,
+  generate.plots = TRUE
+)
+```

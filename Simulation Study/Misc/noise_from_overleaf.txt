@@ -1,0 +1,275 @@
+---------------------------------------------------------------------   Marginal Estimate Plots   ---------------------------------------------------------------------------
+
+Figure \ref{fig:true_rmst_ss} presents the true marginal restricted mean survival time (RMST) difference curve used as the benchmark in the simulation study. The curve represents the true causal RMST difference over the follow-up period and serves as the reference against which the RMST estimates obtained from the MS-Cox and case-base models are evaluated in the subsequent analyses.
+
+% show true rmst curves
+\begin{figure}[H]
+    \centering
+     \includegraphics[width=1\textwidth]{Figures/Simulation Study/true-rmst.pdf}
+    \caption{True RMST Curves}
+    \label{fig:true_rmst_ss}
+\end{figure}
+
+\newpage
+
+\newpage
+
+Figure \ref{fig:true_hr_ss} displays the distribution of the true marginal hazard ratios obtained across the simulation replicates. This distribution serves as the benchmark for evaluating the finite-sample performance of the MS-Cox and case-base estimators in terms of bias, variability, and confidence interval coverage.
+
+
+% show true hr distribution
+\begin{figure}[H]
+    \centering
+     \includegraphics[width=1\textwidth]{Figures/Simulation Study/true-hr.pdf}
+    \caption{True HR Distribution}
+    \label{fig:true_hr_ss}
+\end{figure}
+
+--------------------------------------------------------------------   RMST Tables: Variable DGP   ---------------------------------------------------------------------------
+
+\newpage
+
+Table \ref{tab:sim_rmst_s1} summarizes the finite-sample performance of the marginal structural Cox (MS-Cox) and inverse probability weighted (IPW) case-base estimators for the causal RMST difference under the null treatment effect scenario, evaluated at fixed horizons $\tau \in \{1,2,3,4\}$.. For both methods, the mean estimated RMST difference remains close to the true value of zero at each evaluation horizon, although the estimates become slightly more negative as $\tau$ increases. The absolute bias increases gradually with $\tau$, reflecting the greater difficulty of estimating RMST at longer follow-up times, while the accompanying Monte Carlo standard errors also increase because of the larger sampling variability. The empirical standard deviation, mean estimated standard error, and RMSE all increase monotonically with $\tau$, consistent with the reduction in effective sample size at later time points. For the MS-Cox estimator, the empirical coverage remains stable and close to the nominal $95\%$ level across all horizons, ranging from 0.966 to 0.970. In contrast, the case-base estimator exhibits comparable coverage for shorter horizons but shows a noticeable decline at $\tau = 4$, where coverage decreases to 0.892, indicating some underestimation of uncertainty at longer follow-up times. Despite this difference in interval coverage, the two approaches produce nearly identical RMST point estimates, biases, empirical standard deviations, estimated standard errors, and RMSE values across all evaluation horizons, demonstrating essentially equivalent estimation performance for the causal RMST difference.
+
+
+% show rmst table setting: n = 1000, beta.A = 0
+\begin{table}[htbp]
+\centering
+\caption{Finite-sample performance of the MS-Cox and IPW case-base estimators for the causal RMST difference $\text{RMST}(\tau) = \text{RMST}^{(1)}(\tau) - \text{RMST}^{(0)}(\tau)$, evaluated at fixed horizons $\tau \in \{1,2,3,4\}$. Bias and coverage are reported with Monte Carlo standard errors in parentheses. Results shown for the null-effect scenario ($\beta_A = 0$, $n = 1000$). Note the True RMST column represents the mean marginal RMST difference at each $\tau$. All results are based on 1000 replications.}
+\label{tab:sim_rmst_s1}
+\renewcommand{\arraystretch}{1.15}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{c l c c c c c c c}
+\toprule
+$\tau$ & Method & True RMST & Mean $\widehat{\text{RMST}}$
+& Bias (MC-SE) & Emp.\ SD & Mean SE & RMSE & Coverage (MC-SE) \\
+\midrule
+% ----- tau = 1 -----
+\multirow{2}{*}{1}
+& MS-Cox    & \multirow{2}{*}{0} & -0.005 & -0.005 (0.001) & 0.028 & 0.027 & 0.029 & 0.970 (0.005) \\
+& Case-base & & -0.004 & -0.004 (0.001) & 0.026 & 0.023 & 0.026 & 0.944 (0.007) \\
+\midrule
+% ----- tau = 2 -----
+\multirow{2}{*}{2}
+& MS-Cox    & \multirow{2}{*}{0} & -0.015 & -0.015 (0.002) & 0.071 & 0.072 & 0.073 & 0.968 (0.006) \\
+& Case-base & & -0.012 & -0.012 (0.002) & 0.075 & 0.068 & 0.076 & 0.947 (0.007) \\
+\midrule
+% ----- tau = 3 -----
+\multirow{2}{*}{3}
+& MS-Cox    & \multirow{2}{*}{0} & -0.025 & -0.025 (0.004) & 0.117 & 0.120 & 0.119 & 0.967 (0.006) \\
+& Case-base & & -0.022 & -0.022 (0.004) & 0.127 & 0.118 & 0.129 & 0.948 (0.007) \\
+\midrule
+% ----- tau = 4 -----
+\multirow{2}{*}{4}
+& MS-Cox    & \multirow{2}{*}{0} & -0.036 & -0.036 (0.005) & 0.161 & 0.167 & 0.165 & 0.966 (0.006) \\
+& Case-base & & -0.032 & -0.032 (0.005) & 0.173 & 0.155 & 0.176 & 0.892 (0.010) \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\newpage
+
+Table \ref{tab:sim_rmst_s2} summarizes the finite-sample performance of the marginal structural Cox (MS-Cox) and inverse probability weighted (IPW) case-base estimators for the causal RMST difference under the strong treatment effect scenario. For both methods, the mean estimated RMST difference closely follows the true RMST difference, becoming increasingly negative as the evaluation horizon $\tau$ increases. The magnitude of the bias also increases with $\tau$ for both estimators, although the MS-Cox estimator consistently exhibits smaller bias than the case-base estimator at each time horizon. As expected, the empirical standard deviation, mean estimated standard error, and RMSE all increase monotonically with $\tau$, reflecting the greater uncertainty associated with estimating RMST differences at longer follow-up times. For the MS-Cox estimator, empirical coverage remains close to the nominal $95\%$ level across all horizons, decreasing only slightly from 0.985 at $\tau=1$ to 0.939 at $\tau=4$. In contrast, the case-base estimator demonstrates substantially lower coverage throughout, ranging from 0.876 at $\tau=1$ to 0.810 at $\tau=2$, before increasing modestly to 0.892 at $\tau=4$, indicating persistent undercoverage despite the increase in reported standard errors at longer horizons. Overall, both methods display similar patterns in variability and precision as $\tau$ increases; however, under a strong treatment effect the MS-Cox estimator yields consistently smaller bias and more reliable confidence interval coverage than the case-base estimator, leading to improved finite-sample performance.
+
+
+% show rmst table setting: n = 1000, beta.A = 1
+\begin{table}[htbp]
+\centering
+\caption{Finite-sample performance of the MS-Cox and IPW case-base estimators for the causal RMST difference $\text{RMST}(\tau) = \text{RMST}^{(1)}(\tau) - \text{RMST}^{(0)}(\tau)$, evaluated at fixed horizons $\tau \in \{1,2,3,4\}$. Bias and coverage are reported with Monte Carlo standard errors in parentheses. Results shown for the strong-effect scenario ($\beta_A = 1$, $n = 1000$). Note the True RMST column represents the mean marginal RMST difference at each $\tau$. All results are based on 1000 replications.}
+\label{tab:sim_rmst_s2}
+\renewcommand{\arraystretch}{1.15}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{c l c c c c c c c}
+\toprule
+$\tau$ & Method & True RMST & Mean $\widehat{\text{RMST}}$
+& Bias (MC-SE) & Emp.\ SD & Mean SE & RMSE & Coverage (MC-SE) \\
+\midrule
+% ----- tau = 1 -----
+\multirow{2}{*}{1}
+& MS-Cox    & \multirow{2}{*}{-0.168} & -0.174 & -0.006 (0.001) & 0.035 & 0.042 & 0.035 & 0.985 (0.004) \\
+& Case-base & & -0.166 & 0.001 (0.001) & 0.035 & 0.025 & 0.035 & 0.876 (0.010) \\
+\midrule
+% ----- tau = 2 -----
+\multirow{2}{*}{2}
+& MS-Cox    & \multirow{2}{*}{-0.400} & -0.418 & -0.017 (0.003) & 0.085 & 0.091 & 0.087 & 0.967 (0.006) \\
+& Case-base & & -0.447 & -0.046 (0.003) & 0.091 & 0.070 & 0.102 & 0.810 (0.012) \\
+\midrule
+% ----- tau = 3 -----
+\multirow{2}{*}{3}
+& MS-Cox    & \multirow{2}{*}{-0.623} & -0.651 & -0.028 (0.004) & 0.133 & 0.132 & 0.135 & 0.946 (0.007) \\
+& Case-base & & -0.699 & -0.076 (0.004) & 0.139 & 0.116 & 0.159 & 0.824 (0.012) \\
+\midrule
+% ----- tau = 4 -----
+\multirow{2}{*}{4}
+& MS-Cox    & \multirow{2}{*}{-0.825} & -0.861 & -0.037 (0.006) & 0.174 & 0.165 & 0.178 & 0.939 (0.008) \\
+& Case-base & & -0.892 & -0.067 (0.006) & 0.178 & 0.155 & 0.191 & 0.892 (0.010) \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\newpage
+
+Table \ref{tab:sim_rmst_s3} summarizes the finite-sample performance of the marginal structural Cox (MS-Cox) and inverse probability weighted (IPW) case-base estimators for the causal RMST difference under the moderate treatment effect scenario. For both methods, the mean estimated RMST difference closely tracks the true RMST difference, with increasingly negative estimates as the evaluation horizon $\tau$ increases. The absolute bias increases gradually with $\tau$ for both estimators, although the MS-Cox estimator consistently exhibits smaller bias than the case-base estimator at each evaluation horizon. As expected, the empirical standard deviation, mean estimated standard error, and RMSE all increase monotonically with $\tau$, reflecting the increased variability associated with estimating RMST differences at longer follow-up times. For the MS-Cox estimator, empirical coverage remains consistently close to the nominal $95\%$ level, decreasing only slightly from 0.982 at $\tau=1$ to 0.961 at $\tau=4$. In comparison, the case-base estimator exhibits lower coverage across all horizons, ranging from 0.935 at $\tau=1$ to 0.904 at $\tau=3$, with a modest improvement to 0.922 at $\tau=4$, indicating persistent undercoverage despite slightly more conservative standard error estimates at longer follow-up times. Overall, both estimators demonstrate similar trends in variability and estimation precision as $\tau$ increases; however, the MS-Cox estimator consistently produces smaller bias and confidence interval coverage that is substantially closer to the nominal level, whereas the case-base estimator exhibits moderate undercoverage throughout the simulation.
+
+
+% show rmst table setting: n = 1000, beta.A = 0.5
+\begin{table}[htbp]
+\centering
+\caption{Finite-sample performance of the MS-Cox and IPW case-base estimators for the causal RMST difference $\text{RMST}(\tau) = \text{RMST}^{(1)}(\tau) - \text{RMST}^{(0)}(\tau)$, evaluated at fixed horizons $\tau \in \{1,2,3,4\}$. Bias and coverage are reported with Monte Carlo standard errors in parentheses. Results shown for the moderate-effect scenario ($\beta_A = 0.5$, $n = 1000$). Note the True RMST column represents the mean marginal RMST difference at each $\tau$. All results are based on 1000 replications.}
+\label{tab:sim_rmst_s3}
+\renewcommand{\arraystretch}{1.15}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{c l c c c c c c c}
+\toprule
+$\tau$ & Method & True RMST & Mean $\widehat{\text{RMST}}$
+& Bias (MC-SE) & Emp.\ SD & Mean SE & RMSE & Coverage (MC-SE) \\
+\midrule
+% ----- tau = 1 -----
+\multirow{2}{*}{1}
+& MS-Cox    & \multirow{2}{*}{-0.078} & -0.083 & -0.005 (0.001) & 0.031 & 0.035 & 0.031 & 0.982 (0.004) \\
+& Case-base & & -0.075 & 0.003 (0.001) & 0.029 & 0.024 & 0.029 & 0.935 (0.008) \\
+\midrule
+% ----- tau = 2 -----
+\multirow{2}{*}{2}
+& MS-Cox    & \multirow{2}{*}{-0.196} & -0.211 & -0.015 (0.002) & 0.078 & 0.084 & 0.079 & 0.969 (0.005) \\
+& Case-base & & -0.217 & -0.021 (0.003) & 0.082 & 0.070 & 0.084 & 0.908 (0.009) \\
+\midrule
+% ----- tau = 3 -----
+\multirow{2}{*}{3}
+& MS-Cox    & \multirow{2}{*}{-0.315} & -0.341 & -0.026 (0.004) & 0.125 & 0.131 & 0.128 & 0.966 (0.006) \\
+& Case-base & & -0.360 & -0.045 (0.004) & 0.134 & 0.118 & 0.141 & 0.904 (0.009) \\
+\midrule
+% ----- tau = 4 -----
+\multirow{2}{*}{4}
+& MS-Cox    & \multirow{2}{*}{-0.428} & -0.463 & -0.036 (0.005) & 0.170 & 0.173 & 0.173 & 0.961 (0.006) \\
+& Case-base & & -0.481 & -0.053 (0.006) & 0.177 & 0.160 & 0.185 & 0.922 (0.008) \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\newpage
+
+Table \ref{tab:sim_rmst_s4} summarizes the finite-sample performance of the marginal structural Cox (MS-Cox) and inverse probability weighted (IPW) case-base estimators for the causal RMST difference under the moderate treatment effect scenario with a reduced sample size of (n=500). For both methods, the mean estimated RMST difference follows the true RMST difference closely, becoming increasingly negative as the evaluation horizon ($\tau$) increases. The absolute bias increases with ($\tau$) for both estimators, with the MS-Cox estimator consistently exhibiting smaller bias than the case-base estimator across all evaluation horizons. As expected, the empirical standard deviation, mean estimated standard error, and RMSE increase monotonically with ($\tau$), reflecting the greater uncertainty associated with estimating RMST differences at longer follow-up times. Relative to the corresponding scenario with (n=1000), both estimators exhibit larger bias, greater variability, and larger standard errors, consistent with the reduction in estimation precision resulting from the smaller sample size. For the MS-Cox estimator, empirical coverage remains close to the nominal $95\%$ level, ranging from 0.955 to 0.988 across the four horizons. In contrast, the case-base estimator continues to exhibit lower coverage, varying between 0.915 and 0.934, with only a slight improvement to 0.925 at ($\tau=4$). Overall, reducing the sample size adversely affects the performance of both estimators by increasing bias and estimation variability; however, the MS-Cox estimator maintains confidence interval coverage close to the nominal level, whereas the case-base estimator exhibits persistent undercoverage despite producing point estimates with similar trends across the evaluation horizons.
+
+
+% show rmst table setting: n = 500, beta.A = 0.5
+\begin{table}[htbp]
+\centering
+\caption{Finite-sample performance of the MS-Cox and IPW case-base estimators for the causal RMST difference $\text{RMST}(\tau) = \text{RMST}^{(1)}(\tau) - \text{RMST}^{(0)}(\tau)$, evaluated at fixed horizons $\tau \in \{1,2,3,4\}$. Bias and coverage are reported with Monte Carlo standard errors in parentheses. Results shown for the moderate-effect scenario ($\beta_A = 0.5$, $n = 500$). Note the True RMST column represents the mean marginal RMST difference at each $\tau$. All results are based on 500 replications.}
+\label{tab:sim_rmst_s4}
+\renewcommand{\arraystretch}{1.15}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{c l c c c c c c c}
+\toprule
+$\tau$ & Method & True RMST & Mean $\widehat{\text{RMST}}$
+& Bias (MC-SE) & Emp.\ SD & Mean SE & RMSE & Coverage (MC-SE) \\
+\midrule
+% ----- tau = 1 -----
+\multirow{2}{*}{1}
+& MS-Cox    & \multirow{2}{*}{-0.078} & -0.085 & -0.007 (0.001) & 0.039 & 0.046 & 0.039 & 0.988 (0.003) \\
+& Case-base & & -0.077 & 0.001 (0.001) & 0.037 & 0.032 & 0.037 & 0.934 (0.008) \\
+\midrule
+% ----- tau = 2 -----
+\multirow{2}{*}{2}
+& MS-Cox    & \multirow{2}{*}{-0.196} & -0.218 & -0.022 (0.003) & 0.098 & 0.111 & 0.100 & 0.974 (0.005) \\
+& Case-base & & -0.223 & -0.027 (0.003) & 0.105 & 0.094 & 0.108 & 0.915 (0.009) \\
+\midrule
+% ----- tau = 3 -----
+\multirow{2}{*}{3}
+& MS-Cox    & \multirow{2}{*}{-0.315} & -0.353 & -0.038 (0.005) & 0.157 & 0.173 & 0.162 & 0.966 (0.006) \\
+& Case-base & & -0.370 & -0.055 (0.005) & 0.171 & 0.159 & 0.180 & 0.917 (0.009) \\
+\midrule
+% ----- tau = 4 -----
+\multirow{2}{*}{4}
+& MS-Cox    & \multirow{2}{*}{-0.428} & -0.479 & -0.052 (0.007) & 0.213 & 0.228 & 0.219 & 0.955 (0.007) \\
+& Case-base & & -0.494 & -0.067 (0.007) & 0.227 & 0.216 & 0.237 & 0.925 (0.008) \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\newpage
+
+Table \ref{tab:sim_rmst_s5} summarizes the finite-sample performance of the marginal structural Cox (MS-Cox) and inverse probability weighted (IPW) case-base estimators for the causal RMST difference under the moderate treatment effect scenario with a further reduced sample size of (n=250). For both methods, the mean estimated RMST difference continues to closely follow the true RMST difference, with increasingly negative estimates as the evaluation horizon ($\tau$) increases. The absolute bias increases substantially with ($\tau$) for both estimators, with the MS-Cox estimator maintaining slightly smaller bias than the case-base estimator across all horizons. The empirical standard deviation, mean estimated standard error, and RMSE all increase steadily with ($\tau$), indicating the growing uncertainty associated with estimating RMST differences over longer follow-up periods. Compared with the corresponding scenarios with (n=500) and (n=1000), both estimators exhibit further increases in bias, empirical variability, and standard errors, reflecting the expected loss of precision resulting from the smaller sample size. Despite this reduction in sample size, the MS-Cox estimator maintains empirical coverage close to the nominal $95\%$ level, ranging from 0.946 to 0.981 across the four evaluation horizons. In contrast, the case-base estimator continues to demonstrate systematic undercoverage, with empirical coverage varying between 0.907 and 0.925 across all values of ($\tau$). Overall, decreasing the sample size to (n=250) accentuates the increase in bias and estimation variability for both methods while reducing confidence interval performance. Nevertheless, the MS-Cox estimator continues to provide more reliable inference through smaller bias and near-nominal coverage, whereas the case-base estimator consistently underestimates uncertainty despite exhibiting similar patterns in point estimation and variability.
+
+
+% show rmst table setting: n = 250, beta.A = 0.5
+\begin{table}[htbp]
+\centering
+\caption{Finite-sample performance of the MS-Cox and IPW case-base estimators for the causal RMST difference $\text{RMST}(\tau) = \text{RMST}^{(1)}(\tau) - \text{RMST}^{(0)}(\tau)$, evaluated at fixed horizons $\tau \in \{1,2,3,4\}$. Bias and coverage are reported with Monte Carlo standard errors in parentheses. Results shown for the moderate-effect scenario ($\beta_A = 0.5$, $n = 250$). Note the True RMST column represents the mean marginal RMST difference at each $\tau$. All
+results are based on 1000 replications.}
+\label{tab:sim_rmst_s5}
+\renewcommand{\arraystretch}{1.15}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{c l c c c c c c c}
+\toprule
+$\tau$ & Method & True RMST & Mean $\widehat{\text{RMST}}$
+& Bias (MC-SE) & Emp.\ SD & Mean SE & RMSE & Coverage (MC-SE) \\
+\midrule
+% ----- tau = 1 -----
+\multirow{2}{*}{1}
+& MS-Cox    & \multirow{2}{*}{-0.078} & -0.090 & -0.013 (0.002) & 0.051 & 0.061 & 0.053 & 0.981 (0.004) \\
+& Case-base & & -0.082 & -0.004 (0.002) & 0.051 & 0.044 & 0.051 & 0.925 (0.008) \\
+\midrule
+% ----- tau = 2 -----
+\multirow{2}{*}{2}
+& MS-Cox    & \multirow{2}{*}{-0.196} & -0.232 & -0.037 (0.004) & 0.130 & 0.147 & 0.135 & 0.970 (0.005) \\
+& Case-base & & -0.235 & -0.040 (0.004) & 0.142 & 0.128 & 0.147 & 0.908 (0.009) \\
+\midrule
+% ----- tau = 3 -----
+\multirow{2}{*}{3}
+& MS-Cox    & \multirow{2}{*}{-0.315} & -0.377 & -0.062 (0.007) & 0.211 & 0.228 & 0.220 & 0.963 (0.006) \\
+& Case-base & & -0.390 & -0.075 (0.007) & 0.231 & 0.215 & 0.243 & 0.907 (0.009) \\
+\midrule
+% ----- tau = 4 -----
+\multirow{2}{*}{4}
+& MS-Cox    & \multirow{2}{*}{-0.428} & -0.512 & -0.084 (0.009) & 0.286 & 0.300 & 0.298 & 0.946 (0.007) \\
+& Case-base & & -0.521 & -0.094 (0.010) & 0.308 & 0.292 & 0.321 & 0.915 (0.009) \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\newpage
+
+Table \ref{tab:sim_rmst_s6} summarizes the finite-sample performance of the marginal structural Cox (MS-Cox) and inverse probability weighted (IPW) case-base estimators for the causal RMST difference under the moderate treatment effect scenario with heavy censoring. For both methods, the mean estimated RMST difference closely follows the true RMST difference, becoming increasingly negative as the evaluation horizon ($\tau$) increases. The absolute bias increases with ($\tau$) for both estimators, although the two methods exhibit comparable levels of bias across the four evaluation horizons, with the MS-Cox estimator performing slightly better at shorter horizons and the case-base estimator exhibiting marginally smaller bias at ($\tau=4$). As expected, the empirical standard deviation, mean estimated standard error, and RMSE all increase monotonically with ($\tau$), reflecting the increased uncertainty associated with estimating RMST differences at longer follow-up times under heavy censoring. The MS-Cox estimator maintains empirical coverage close to the nominal $95\%$ level, decreasing modestly from 0.985 at ($\tau=1$) to 0.938 at ($\tau=4$). The case-base estimator also demonstrates improved coverage relative to the corresponding moderate-effect scenario without heavy censoring, with empirical coverage increasing from 0.943 at ($\tau=1$) to 0.936 at ($\tau=4$). Overall, both estimators exhibit better confidence interval coverage under heavy censoring, with the improvement being particularly noticeable for the case-base estimator, whose coverage approaches that of the MS-Cox estimator at longer evaluation horizons. Despite the increased censoring, both methods continue to display similar trends in point estimation, variability, and precision, while the MS-Cox estimator retains a slight advantage in overall inferential performance.
+
+% show rmst table setting: n = 1000, beta.A = 0.5, heavy censoring
+\begin{table}[htbp]
+\centering
+\caption{Finite-sample performance of the MS-Cox and IPW case-base estimators for the causal RMST difference $\text{RMST}(\tau) = \text{RMST}^{(1)}(\tau) - \text{RMST}^{(0)}(\tau)$, evaluated at fixed horizons $\tau \in \{1,2,3,4\}$. Bias and coverage are reported with Monte Carlo standard errors in parentheses. Results shown for the heavily censored moderate-effect scenario ($\beta_A = 0.5$, $n = 1000$). Note the True RMST column represents the mean marginal RMST difference at each $\tau$. All
+results are based on 1000 replications.}
+\label{tab:sim_rmst_s6}
+\renewcommand{\arraystretch}{1.15}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{c l c c c c c c c}
+\toprule
+$\tau$ & Method & True RMST & Mean $\widehat{\text{RMST}}$
+& Bias (MC-SE) & Emp.\ SD & Mean SE & RMSE & Coverage (MC-SE) \\
+\midrule
+% ----- tau = 1 -----
+\multirow{2}{*}{1}
+& MS-Cox    & \multirow{2}{*}{-0.078} & -0.087 & -0.009 (0.001) & 0.034 & 0.039 & 0.035 & 0.985 (0.004) \\
+& Case-base & & -0.081 & -0.004 (0.001) & 0.034 & 0.029 & 0.034 & 0.943 (0.007) \\
+\midrule
+% ----- tau = 2 -----
+\multirow{2}{*}{2}
+& MS-Cox    & \multirow{2}{*}{-0.196} & -0.223 & -0.027 (0.003) & 0.087 & 0.093 & 0.091 & 0.968 (0.006) \\
+& Case-base & & -0.228 & -0.032 (0.003) & 0.092 & 0.083 & 0.097 & 0.904 (0.009) \\
+\midrule
+% ----- tau = 3 -----
+\multirow{2}{*}{3}
+& MS-Cox    & \multirow{2}{*}{-0.315} & -0.360 & -0.045 (0.004) & 0.140 & 0.145 & 0.147 & 0.949 (0.007) \\
+& Case-base & & -0.368 & -0.053 (0.005) & 0.146 & 0.137 & 0.155 & 0.911 (0.009) \\
+\midrule
+% ----- tau = 4 -----
+\multirow{2}{*}{4}
+& MS-Cox    & \multirow{2}{*}{-0.428} & -0.494 & -0.066 (0.006) & 0.192 & 0.194 & 0.203 & 0.938 (0.008) \\
+& Case-base & & -0.480 & -0.052 (0.006) & 0.190 & 0.182 & 0.197 & 0.936 (0.008) \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
