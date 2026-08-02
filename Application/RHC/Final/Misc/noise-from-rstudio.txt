@@ -1,0 +1,286 @@
+### Plot MS-Cox Counterfactual Survival Curves
+```{r}
+par(mfrow = c(2, 1))
+
+plot(
+  tau.grid,
+  S0.cox,
+  type = "s", 
+  lwd = 2,
+  col = "red",
+  ylim = c(0, 1),
+  xlab = "Days",
+  ylab = "Survival Probability",
+  main = "MS-Cox: Counterfactual Survival Curves"
+)
+
+lines(
+  tau.grid,
+  S1.cox,
+  type = "s",
+  lwd = 2, 
+  col = "blue"
+)
+
+legend(
+  "topright",
+  legend = c("A = 0", "A = 1"),
+  col = c("red", "blue"),
+  lty = 1,
+  lwd = 2
+)
+
+plot(
+  tau.grid,
+  S0.cox,
+  type = "s", 
+  lwd = 2,
+  col = "red",
+  ylim = c(0.6, 1),
+  xlim = c(0, 30),
+  xlab = "Days",
+  ylab = "Survival Probability",
+  main = "MS-Cox: Counterfactual Survival Curves - First Month"
+)
+
+lines(
+  tau.grid,
+  S1.cox,
+  type = "s",
+  lwd = 2, 
+  col = "blue"
+)
+
+legend(
+  "topright",
+  legend = c("A = 0", "A = 1"),
+  col = c("red", "blue"),
+  lty = 1,
+  lwd = 2
+)
+```
+
+
+### Plot CB Counterfactual Survival Curves
+```{r}
+par(mfrow = c(2, 1))
+
+plot(
+  S0.cb, 
+  type = "l", 
+  lwd = 2,
+  col = "red",
+  ylim = c(0, 1),
+  xlab = "Days", 
+  ylab = "Survival Probability",
+  main = "IPW Case Base: Counterfactual Survival Curves"
+)
+
+lines(
+  S1.cb,
+  lwd = 2,
+  col = "blue"
+)
+
+legend(
+  "topright",
+  legend = c("A = 0", "A = 1"),
+  col = c("red", "blue"),
+  lty = 1, 
+  lwd = 2
+)
+
+plot(
+  S0.cb, 
+  type = "l", 
+  lwd = 2,
+  col = "red",
+  ylim = c(0.6, 1),
+  xlim = c(0, 30),
+  xlab = "Days", 
+  ylab = "Survival Probability",
+  main = "IPW Case Base: Counterfactual Survival Curves - First Month"
+)
+
+lines(
+  S1.cb,
+  lwd = 2,
+  col = "blue"
+)
+
+legend(
+  "topright",
+  legend = c("A = 0", "A = 1"),
+  col = c("red", "blue"),
+  lty = 1, 
+  lwd = 2
+)
+```
+
+\newpage
+# Survival Curves using MS-Cox and IPW Case Base Models
+
+## Generate MS-Cox Survival Curve
+```{r, cache=TRUE}
+sf.cox.ind <- survfit(
+  model.5,
+  newdata = individual.profile.data
+)
+
+S.cox <- approx(
+  sf.cox.ind$time,
+  sf.cox.ind$surv,
+  xout = tau.grid,
+  method = "constant",
+  rule = 2
+)$y
+
+Lo.cox <- approx(
+  sf.cox.ind$time,
+  sf.cox.ind$lower,
+  xout = tau.grid,
+  method = "constant",
+  rule = 2
+)$y
+
+Up.cox <- approx(
+  sf.cox.ind$time,
+  sf.cox.ind$upper,
+  xout = tau.grid,
+  method = "constant",
+  rule = 2
+)$y
+```
+
+## Generate Case Base Survival Curve
+```{r, cache=TRUE, message=FALSE}
+set.seed(s)
+n.boot <- 200
+
+boot.surv <- replicate(n.boot, {
+  idx <- sample(nrow(data.set), replace = TRUE)
+  boot.data <- data.set[idx, ]
+
+  boot.fit <- FSH(
+    Delta ~ pspline(time, df = 2) * A,
+    data = boot.data,
+    ratio = 10,
+    weights = ipw.stabilized[idx]
+  )
+
+  ar <- absoluteRisk(
+    boot.fit,
+    time = tau.grid,
+    newdata = individual.profile.data,
+    type = "survival"
+  )
+  ar[, 2]
+})
+
+S.cb  <- absoluteRisk(
+  model.8,
+  time = tau.grid,
+  newdata = individual.profile.data,
+  type = "survival"
+)[, 2]
+
+Lo.cb <- apply(
+  boot.surv,
+  1,
+  quantile,
+  probs = 0.025,
+  na.rm = TRUE
+)
+
+Up.cb <- apply(
+  boot.surv,
+  1,
+  quantile,
+  probs = 0.975,
+  na.rm = TRUE
+)
+```
+
+## Plot Survival Curves
+```{r}
+par(mfrow = c(2, 1))
+
+plot(
+  tau.grid,
+  S.cox,
+  type = "n",
+  ylim = c(0, 1),
+  xlab = "Days",
+  ylab = "Survival Probability",
+  main = "Estimated Survival Probability After RHC"
+)
+
+# shaded bands first, lines on top
+polygon(
+  c(tau.grid, rev(tau.grid)),
+  c(Lo.cox, rev(Up.cox)),
+  col = fill.cox,
+  border = NA
+)
+
+polygon(
+  c(tau.grid, rev(tau.grid)),
+  c(Lo.cb, rev(Up.cb)),
+  col = fill.cb,
+  border = NA
+)
+
+lines(tau.grid, S.cox, col = col.cox, lwd = 2, type = "s")
+lines(tau.grid, S.cb,  col = col.cb,  lwd = 2)
+
+legend(
+  "topright",
+  legend = c(
+    "semi-parametric (MS-Cox)",
+    "parametric (IPW Case Base)"
+  ),
+  col = c(col.cox, col.cb),
+  lty = c(1, 1),
+  bg = "gray90"
+)
+
+plot(
+  tau.grid,
+  S.cox,
+  type = "n",
+  ylim = c(0.6, 1),
+  xlim = c(0, 30),
+  xlab = "Days",
+  ylab = "Survival Probability",
+  main = "Estimated Survival Probability After RHC - First Month"
+)
+
+# shaded bands first, lines on top
+polygon(
+  c(tau.grid, rev(tau.grid)),
+  c(Lo.cox, rev(Up.cox)),
+  col = fill.cox,
+  border = NA
+)
+
+polygon(
+  c(tau.grid, rev(tau.grid)),
+  c(Lo.cb, rev(Up.cb)),
+  col = fill.cb,
+  border = NA
+)
+
+lines(tau.grid, S.cox, col = col.cox, lwd = 2, type = "s")
+lines(tau.grid, S.cb,  col = col.cb,  lwd = 2)
+
+legend(
+  "topright",
+  legend = c(
+    "semi-parametric (MS-Cox)",
+    "parametric (IPW Case Base)"
+  ),
+  col = c(col.cox, col.cb),
+  lty = c(1, 1),
+  bg = "gray90"
+)
+```

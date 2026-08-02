@@ -1,0 +1,1726 @@
+---
+title: "Causal Survival - RHC Application"
+output: pdf_document
+date: "2026-05-31"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+\newpage
+# Package Imports
+
+### EDA
+```{r, warning=FALSE, message=FALSE}
+library("Hmisc")
+library("tableone")
+library("xtable")
+library("ggplot2")
+library("survey")
+library("cobalt")
+```
+
+### Estimation
+```{r, warning=FALSE, message=FALSE}
+library("survival")
+library("casebase")
+library("sandwich")
+library("foreach")
+library("doParallel")
+```
+
+\newpage
+# Data Preparation
+```{r}
+## Set random seed for reproducibility
+s = 123
+
+## Load the Right Heart Catheterization (RHC) dataset
+getHdata(rhc)
+```
+
+# Primary Analysis Variables
+```{r, cache=TRUE}
+## Define follow-up time as the time from hospital admission to the last
+## available contact or death date
+time <- as.numeric(
+  pmax(rhc$dthdte, rhc$lstctdte, na.rm = TRUE) - rhc$sadmdte
+)
+
+## Define the binary event indicator:
+## 1 = death, 0 = censored
+Delta <- ifelse(
+  rhc$death == "Yes",
+  1,
+  0
+)
+
+## Define the binary treatment indicator:
+## 1 = right heart catheterization (RHC) performed, 0 = not performed
+A <- ifelse(
+  rhc$swang1 == "RHC",
+  1,
+  0
+)
+```
+
+\newpage
+# Baseline Covariates
+```{r}
+### Demographic and Socioeconomic Characteristics
+
+## Patient sex
+Gender <- rhc$sex
+
+## Patient age at baseline
+Age <- as.numeric(rhc$age)
+
+## Patient weight in kilograms
+## Note: The original dataset encodes some missing values as 0. These values
+## are retained because replacing them with NA substantially alters the
+## estimated propensity scores and covariate balance following weighting.
+Weight <- as.numeric(rhc$wtkilo1)
+
+## Patient race
+Race <- droplevels(rhc$race)
+
+## Educational attainment
+Education <- as.numeric(rhc$edu)
+
+## Income category
+Income <- rhc$income
+
+## Insurance classification
+InsuranceClass <- rhc$ninsclas
+
+
+### Pre-existing Comorbidities
+
+## Names of baseline comorbidity variables to be recoded
+hx.vars <- c(
+  "chfhx",
+  "cardiohx",
+  "dementhx",
+  "psychhx",
+  "chrpulhx",
+  "renalhx",
+  "liverhx",
+  "gibledhx",
+  "malighx",
+  "immunhx",
+  "transhx",
+  "amihx"
+)
+
+## Convert labelled comorbidity variables to binary factors:
+## "No" = absence of comorbidity, "Yes" = presence of comorbidity
+rhc[hx.vars] <- lapply(rhc[hx.vars], function(x) {
+  x <- as.numeric(x)
+  
+  factor(
+    ifelse(x == 1, "Yes", "No"),
+    levels = c("No", "Yes")
+  )
+})
+
+## Extract recoded comorbidity variables for the analysis dataset
+CHFhx <- rhc$chfhx
+CARDIOhx <- rhc$cardiohx
+DEMENThx <- rhc$dementhx
+PSYCHhx <- rhc$psychhx
+CHRPULhx <- rhc$chrpulhx
+RENALhx <- rhc$renalhx
+LIVERhx <- rhc$liverhx
+GIBLEDhx <- rhc$gibledhx
+MALIGhx <- rhc$malighx
+IMMUNhx <- rhc$immunhx
+TRANShx <- rhc$transhx
+AMIhx <- rhc$amihx
+
+
+### Disease Severity and Clinical Characteristics
+
+## Indicator of cancer diagnosis
+Cancer <- rhc$ca
+
+## Primary disease category
+Category <- droplevels(rhc$cat1)
+
+## Baseline disease severity score
+Severity <- as.numeric(rhc$das2d3pc)
+```
+
+\newpage
+# Construct Analysis Dataset
+```{r}
+## Combine the outcome, treatment, and baseline covariates into a single
+## analysis-ready dataset
+data.set <- data.frame(
+  time = time,
+  Delta = Delta,
+  A = A,
+  
+  Gender = Gender,
+  Age = Age,
+  Weight = Weight,
+  Race = Race,
+  Education = Education,
+  Income = Income,
+  InsuranceClass = InsuranceClass,
+  
+  CHFhx = CHFhx,
+  CARDIOhx = CARDIOhx,
+  DEMENThx = DEMENThx,
+  PSYCHhx = PSYCHhx,
+  CHRPULhx = CHRPULhx,
+  RENALhx = RENALhx,
+  LIVERhx = LIVERhx,
+  GIBLEDhx = GIBLEDhx,
+  MALIGhx = MALIGhx,
+  IMMUNhx = IMMUNhx,
+  TRANShx = TRANShx,
+  AMIhx = AMIhx,
+  
+  Cancer = Cancer,
+  Category = Category,
+  Severity = Severity
+)
+```
+
+# Plotting Parameters
+```{r}
+## Define colours used to distinguish the marginal structural Cox model
+## and the case-base model in survival and hazard ratio plots
+col.cox <- "red"
+col.cb <- "blue"
+
+## Define semi-transparent fill colours for confidence interval bands
+fill.cox <- rgb(1,0,0,0.20)
+fill.cb  <- rgb(0,0,1,0.20)
+
+## Define semi-transparent colours for the exposed and control treatment groups
+col.exposed <- rgb(0,0,1,0.5)
+col.control <- rgb(1,0,0,0.5)
+```
+
+\newpage
+# Propensity Score Estimation
+```{r}
+## Set seed to ensure reproducibility of any downstream procedures involving
+## randomization or resampling
+set.seed(s)
+
+## Estimate the propensity score, defined as the probability of receiving
+## treatment conditional on the observed baseline covariates
+propensity.score <- fitted(
+  glm(
+    A ~ Gender +
+      Age +
+      Weight +
+      Race +
+      Education +
+      Income +
+      InsuranceClass +
+      CHFhx +
+      CARDIOhx +
+      DEMENThx +
+      PSYCHhx +
+      CHRPULhx +
+      RENALhx +
+      LIVERhx +
+      GIBLEDhx +
+      MALIGhx +
+      IMMUNhx +
+      TRANShx +
+      AMIhx + 
+      Cancer + 
+      Category + 
+      Severity,
+    data = data.set,
+    family = binomial(link = "logit")
+  )
+)
+
+## Separate estimated propensity scores by treatment group to assess the
+## degree of overlap in treatment assignment probabilities
+propensity.score.0 <- propensity.score[A == 0]
+propensity.score.1 <- propensity.score[A == 1]
+```
+
+# Propensity Score Overlap
+```{r}
+## Plot the propensity score distributions for treated and untreated patients
+## to visually assess the positivity/overlap condition
+par(
+  mar=c(2,2,2,0)
+)
+
+hist(
+  propensity.score.0,
+  col=col.control,
+  breaks=seq(0,1,by=0.02),
+  ylim=c(0,200),
+  main="Propensity Score Overlap",
+  xlab="Propensity Scores"
+)
+
+hist(
+  propensity.score.1,
+  col=col.exposed,
+  breaks=seq(0,1,by=0.02),
+  add=T
+)
+
+box()
+
+legend(
+  "topright",
+  legend=c('A = 0', 'A = 1'),
+  fill=c(col.control,col.exposed),
+  border="black",
+  bty="n"
+)
+```
+
+\newpage
+# Stabilized Inverse Probability Weights
+```{r}
+## Estimate the marginal probability of treatment, used to construct the
+## numerator of the stabilized treatment weights
+p.A1 <- mean(A)
+
+## Calculate unstabilized inverse probability of treatment weights (IPWs)
+## by taking the inverse of the estimated probability of the treatment
+## actually received
+ipw.unstabilized <- ifelse(
+  A == 1,
+  1 / propensity.score,
+  1 / (1 - propensity.score)
+)
+
+## Calculate stabilized IPWs by incorporating the marginal probability of
+## treatment in the numerator. Stabilization reduces the variability of the
+## weights while preserving their role in creating a weighted pseudo-population
+ipw.stabilized <- ifelse(
+  A == 1,
+  p.A1 / propensity.score,
+  (1 - p.A1) / (1 - propensity.score)
+)
+```
+
+# IPW Distribution
+```{r}
+## Compare the distributions of the unstabilized and stabilized IPWs to
+## assess the magnitude and variability of the resulting weights
+par(
+  mar=c(2,2,2,0)
+)
+
+hist(
+  ipw.unstabilized,
+  col=col.control,
+  breaks=seq(0, max(ipw.unstabilized) + 0.5,by=0.1),
+  ylim=c(0,1000),
+  xlim=c(0, 10),
+  main="Unstablized vs. Stabilized IPWs",
+  ylab="Frequency",
+  xlab="IPWs"
+)
+
+hist(
+  ipw.stabilized,
+  col=col.exposed,
+  breaks=seq(0, max(ipw.stabilized) + 0.5,by=0.1),
+  add=T
+)
+
+box()
+
+legend(
+  "topright",
+  legend=c('Unstabilized', 'Stabilized'),
+  fill=c(col.control,col.exposed),
+  border="black", bty="n"
+)
+```
+
+\newpage
+# Descriptive Statistics: Table One
+```{r}
+## Specify the baseline covariates to be included in the descriptive table
+covariates = c(
+  "Gender",
+  "Age",
+  "Weight",
+  "Race",
+  "Education",
+  "Income",
+  "InsuranceClass",
+  
+  "CHFhx",
+  "CARDIOhx",
+  "DEMENThx",
+  "PSYCHhx",
+  "CHRPULhx",
+  "RENALhx",
+  "LIVERhx",
+  "GIBLEDhx",
+  "MALIGhx",
+  "IMMUNhx",
+  "TRANShx",
+  "AMIhx",
+  
+  "Cancer",
+  "Category",
+  "Severity"
+)
+
+## Generate the unweighted baseline characteristics table, stratified by
+## treatment group. Statistical significance tests are omitted because the
+## primary objective is descriptive comparison of baseline characteristics.
+table.one.original <- CreateTableOne(
+  vars = covariates,
+  strata = "A",
+  data = data.set,
+  test = FALSE
+)
+
+## Display standardized mean differences (SMDs) to quantify baseline
+## differences between the treatment groups
+print(table.one.original, smd = TRUE)
+```
+
+\newpage
+# Weighted Descriptive Statistics: Table Two
+```{r, warning=FALSE, message=FALSE}
+## Construct a survey design object using the stabilized IPWs. Setting ids = ~0
+## specifies that observations are treated as independent sampling units.
+data.set.ipw <- svydesign(
+  ids = ~ 0,
+  data = data.set,
+  weights = ipw.stabilized
+)
+
+## Generate the weighted baseline characteristics table using the IPW-defined
+## pseudo-population, stratified by treatment group
+table.one.ipw <- svyCreateTableOne(
+  vars = covariates,
+  strata = "A",
+  data = data.set.ipw,
+  test = FALSE
+)
+
+## Display standardized mean differences for the weighted covariate
+## distributions to assess residual imbalance after IPW
+print(table.one.ipw, smd = TRUE)
+```
+
+\newpage
+# Covariate Balance Before and After IPW
+```{r, warning=FALSE, message=FALSE}
+## Assess covariate balance before and after application of the stabilized
+## inverse probability weights. The unweighted and weighted SMDs are retained
+## to facilitate direct comparison of balance across treatment groups.
+balance <- bal.tab(
+  A ~ Gender +
+    Age +
+    Weight +
+    Race +
+    Education +
+    Income +
+    InsuranceClass +
+    CHFhx +
+    CARDIOhx +
+    DEMENThx +
+    PSYCHhx +
+    CHRPULhx +
+    RENALhx +
+    LIVERhx +
+    GIBLEDhx +
+    MALIGhx +
+    IMMUNhx +
+    TRANShx +
+    AMIhx + 
+    Cancer + 
+    Category + 
+    Severity,
+  data = data.set,
+  weights = ipw.stabilized,
+  method = "weighting",
+  estimand = "Average Treatment Effect",
+  un = TRUE
+)
+
+## Visualize the standardized mean differences before and after IPW.
+## An absolute SMD below 0.1 is used as the criterion for acceptable
+## covariate balance.
+love.plot(
+  balance,
+  stats = "mean.diffs",
+  threshold = 0.1,
+  abs = TRUE,
+  line = TRUE,
+  var.order = "unadjusted",
+  colors = c(col.control, col.exposed),
+  shapes = c(17, 16),
+  limits = c(m = c(0, 0.3)),
+  title = "Covariate Balance Before and After IPW",
+  labels = TRUE
+)
+
+## Covariate balance improved substantially following application of the
+## stabilized inverse probability weights, indicating improved comparability
+## between treatment groups in the weighted pseudo-population.
+```
+
+\newpage
+# Estimation
+
+## Assumptions
+*Non-Informative Censoring*
+
+# Modified Case-Base Smooth Hazard Model
+```{r}
+## Modified implementation of fitSmoothHazard() from the casebase package.
+## The function extends the standard case-base fitting procedure to allow
+## observation-level weights, including inverse probability weights (IPWs).
+FSH <- function(
+    formula,
+    data,
+    time,
+    w = rep(1, nrow(data)),
+    ratio = 100, ...  
+) {
+  
+  ## Preserve the original function call for reproducibility and method
+  ## dispatch in downstream model summaries
+  cl <- match.call()
+  
+  ## Explicitly expand "." in the model formula so that all covariates in the
+  ## supplied dataset are represented in the model specification
+  formula <- expand.dot.formula(
+    formula,
+    data = data
+  )
+  
+  ## Extract the event variable from the left-hand side of the model formula
+  eventVar <- all.vars(formula[[2]])
+  
+  ## If the follow-up time variable is not explicitly supplied, infer it from
+  ## the data using the event variable and the standard case-base structure
+  if (missing(time)) {
+    varNames <- checkArgsTimeEvent(
+      data = data,
+      event = eventVar
+    )
+    
+    timeVar <- varNames$time
+    
+  } else {
+    ## Otherwise, use the time variable explicitly supplied by the user
+    timeVar <- time
+  }
+  
+  ## Identify the distinct event types present in the data to determine whether
+  ## the analysis involves a single event or competing risks
+  typeEvents <- sort(unique(data[[eventVar]]))
+  
+  
+  # Case-Base Sampling
+  
+  ## Generate the case-base sample when the input data have not already been
+  ## sampled. The original dataset is retained so that the supplied observation
+  ## weights can be incorporated into the case-base sampling procedure.
+  if (!inherits(data, "cbData")) {
+    
+    originalData <- as.data.frame(data)
+    originalData$w <- w
+    
+    ## Sample cases and controls from the person-time data. The sampling ratio
+    ## controls the number of person-moments sampled relative to observed cases.
+    sampleData <- sampleCaseBase(
+      originalData,
+      timeVar,
+      eventVar,
+      comprisk = (length(typeEvents) > 2),
+      ratio
+    )
+    
+  } else {
+    ## If the input is already a case-base dataset, retain it directly.
+    ## The original unsampled data are unavailable at this stage.
+    originalData <- data.frame()
+    sampleData <- data
+  }
+  
+  
+  # Weighted Case-Base Model
+  
+  ## Include the case-base sampling offset in the model formula. This offset
+  ## accounts for the sampling mechanism when estimating the hazard function.
+  formula <- update(formula, ~ . + offset(offset))
+  
+  ## Fit a weighted binomial regression model to the case-base sample.
+  ## Observation-level weights allow the model to incorporate IPWs in addition
+  ## to the case-base sampling structure.
+  fittingFunction <- function(formula) glm(
+    formula,
+    data = sampleData,
+    family = binomial,
+    weights = w
+  )
+  
+  ## Estimate the smooth hazard model using the weighted case-base sample
+  out <- fittingFunction(formula)
+  
+  
+  # Model Object and Metadata
+  
+  ## Preserve the lower-level glm call while replacing the displayed call with
+  ## the original FSH call for consistency with the custom model interface
+  out$lower_call <- out$call 
+  out$call <- cl
+  
+  ## Store the original data and key variable names for downstream methods
+  ## such as prediction and plotting
+  out$originalData <- originalData
+  out$typeEvents <- typeEvents
+  out$timeVar <- timeVar
+  out$eventVar <- eventVar
+  
+  ## Record the number of case and background person-moments in the sampled
+  ## case-base dataset
+  num_pm <- table(sampleData[[eventVar]])
+  out$num_cm <- num_pm[2]
+  out$num_bm <- num_pm[1]
+  out$formula <- formula
+  
+  ## Store the case-base sampling offset separately, then reset the model's
+  ## offset to zero so that absolute risk estimation can be performed without
+  ## retaining the sampling correction in the prediction stage
+  out$offset <- out$data$offset
+  out$data$offset <- 0
+  
+  ## Assign a custom class so that methods defined for single-event case-base
+  ## models can be applied to the fitted object
+  class(out) <- c("singleEventCB", class(out))
+  
+  return(out)
+}
+```
+
+# Formula Expansion Helper
+```{r}
+## Expand "." in a model formula into the complete set of covariates available
+## in the supplied dataset. This ensures that the modified FSH function can
+## explicitly evaluate formulas containing "." before fitting the model.
+expand.dot.formula <- function(formula, data = NULL) {
+  
+  ## Check whether the formula contains the "." shorthand for all available
+  ## predictors
+  if (isTRUE("." %in% all.vars(formula))) {
+    
+    ## Preserve the original formula attributes while expanding the terms
+    att <- attributes(formula)
+    
+    try.terms <- try(
+      stats::terms(formula, data = data),
+      silent = TRUE
+    )
+    
+    ## Replace the shorthand formula with its explicitly expanded version when
+    ## the terms object can be constructed successfully
+    if (!is(try.terms, "try-error")) {
+      formula <- formula(try.terms)
+    }
+    
+    ## Restore the original formula attributes after expansion
+    attributes(formula) <- att
+  }
+  
+  ## Return the expanded formula
+  return(formula)
+}
+```
+
+\newpage
+# Case-Base Model Setup
+```{r}
+## Set the case-base sampling ratio used across all case-base model fits.
+## A ratio of 100 samples 100 background person-moments per observed case.
+fsh.ratio <- 100
+```
+
+# Counterfactual Survival Curve Setup
+```{r}
+## Define the two treatment levels used to generate counterfactual survival
+## curves: A = 0 represents no RHC and A = 1 represents RHC
+trt.types <- c(0, 1)
+
+## Create a single-treatment profile for prediction under the treated condition
+individual.profile.data <- data.frame(A = 1)
+
+## Create a prediction dataset containing both treatment levels for estimation
+## of counterfactual survival under each treatment condition
+survival.curves.data <- data.frame(A = trt.types)
+
+# Time Grid Definition
+
+## Determine the maximum observed follow-up time in the analysis dataset
+tau.max <- max(data.set$time, na.rm = TRUE)
+
+## Restrict the primary survival-curve display to the first 150 days
+## (approximately four months) to focus on the relevant follow-up period
+t.max <- 150
+
+## Define the time grid used for RMST integration, spanning the full observed
+## follow-up period at one-day intervals
+tau.grid <- seq(0, tau.max, by = 1)
+
+## Define the time grid used for plotting and estimating survival curves over
+## a restricted four-month follow-up period
+t.grid <- seq(0, t.max, by = 1)
+```
+
+\newpage
+# Model 1: Unadjusted Marginal Structural Cox Model
+```{r, cache=TRUE}
+## Set seed to ensure reproducibility of any stochastic procedures used
+## during model fitting
+set.seed(s)
+
+## Fit an unadjusted Cox proportional hazards model with treatment as the
+## sole predictor. The resulting coefficient estimates the marginal
+## log-hazard ratio comparing RHC with no RHC.
+model.1 <- coxph(
+  Surv(time, Delta) ~ A,
+  data = data.set,
+  robust = TRUE
+)
+
+## Extract the treatment coefficient and its standard error
+beta.1 <- coef(model.1)["A"]
+se.1 <- sqrt(diag(vcov(model.1))["A"])
+
+## Transform the treatment coefficient from the log-hazard ratio scale to the
+## hazard ratio scale and calculate the corresponding 95% Wald confidence
+## interval
+cat("HR-hat:", exp(beta.1), "\n")
+cat("SE of HR-hat:", se.1, "\n")
+cat("95% CI: (", exp(beta.1 + c(-1,1)*1.96*se.1), ")\n")
+```
+
+# Model 2: Unadjusted Case-Base Model
+```{r, cache=TRUE, warning=FALSE, message=FALSE}
+## Set seed to ensure reproducibility of the case-base sampling procedure
+set.seed(s)
+
+## Fit an unadjusted smooth hazard model using case-base sampling, with
+## treatment as the sole predictor. The sampling ratio determines the number
+## of background person-moments sampled for each observed case.
+model.2 <- fitSmoothHazard(
+  Delta ~ A,
+  data = data.set,
+  ratio = fsh.ratio
+)
+
+## Extract the treatment coefficient and calculate its robust standard error
+## using the heteroskedasticity-consistent covariance estimator
+beta.2 <- coef(model.2)["A"]
+se.2 <- sqrt(diag(vcovHC(model.2))["A"])
+
+## Transform the treatment coefficient to the hazard ratio scale and calculate
+## the corresponding 95% Wald confidence interval
+cat("HR-hat:", exp(beta.2), "\n")
+cat("SE of HR-hat:", se.2, "\n")
+cat("95% CI: (", exp(beta.2 + c(-1,1)*1.96*se.2), ")\n")
+```
+
+\newpage
+# Model 3: Covariate-Adjusted Cox Model
+```{r, cache=TRUE}
+## Set seed to ensure reproducibility of any stochastic procedures used
+## during model fitting
+set.seed(s)
+
+## Fit a covariate-adjusted Cox proportional hazards model. Treatment is
+## adjusted for the full set of observed baseline demographic, socioeconomic,
+## comorbidity, and disease-severity covariates.
+model.3 <- coxph(
+  Surv(time, Delta) ~ A +
+    Gender +
+    Age +
+    Weight +
+    Race +
+    Education +
+    Income +
+    InsuranceClass +
+    CHFhx +
+    CARDIOhx +
+    DEMENThx +
+    PSYCHhx +
+    CHRPULhx +
+    RENALhx +
+    LIVERhx +
+    GIBLEDhx +
+    MALIGhx +
+    IMMUNhx +
+    TRANShx +
+    AMIhx + 
+    Cancer + 
+    Category + 
+    Severity,
+  data = data.set,
+  robust = TRUE
+)
+
+## Extract the treatment coefficient and its robust standard error
+beta.3 <- coef(model.3)["A"]
+se.3 <- sqrt(diag(vcov(model.3))["A"])
+
+## Transform the treatment coefficient to the hazard ratio scale and calculate
+## the corresponding 95% Wald confidence interval
+cat("HR-hat:", exp(beta.3), "\n")
+cat("SE of HR-hat:", se.3, "\n")
+cat("95% CI: (", exp(beta.3 + c(-1,1)*1.96*se.3), ")\n")
+```
+
+\newpage
+# Model 4: Covariate-Adjusted Case-Base Model
+```{r, cache=TRUE, warning=FALSE, message=FALSE}
+## Set seed to ensure reproducibility of the case-base sampling procedure
+set.seed(s)
+
+## Fit a covariate-adjusted smooth hazard model using case-base sampling.
+## The model uses the same treatment and baseline covariates as the adjusted
+## Cox model to provide a directly comparable alternative estimator.
+model.4 <- fitSmoothHazard(
+  Delta ~ A +
+    Gender +
+    Age +
+    Weight +
+    Race +
+    Education +
+    Income +
+    InsuranceClass +
+    CHFhx +
+    CARDIOhx +
+    DEMENThx +
+    PSYCHhx +
+    CHRPULhx +
+    RENALhx +
+    LIVERhx +
+    GIBLEDhx +
+    MALIGhx +
+    IMMUNhx +
+    TRANShx +
+    AMIhx + 
+    Cancer + 
+    Category + 
+    Severity,
+  data = data.set,
+  ratio = fsh.ratio
+)
+
+## Extract the treatment coefficient and calculate its heteroskedasticity-
+## consistent standard error
+beta.4 <- coef(model.4)["A"]
+se.4 <- sqrt(diag(vcovHC(model.4))["A"])
+
+## Transform the treatment coefficient to the hazard ratio scale and calculate
+## the corresponding 95% Wald confidence interval
+cat("HR-hat:", exp(beta.4), "\n")
+cat("SE of HR-hat:", se.4, "\n")
+cat("95% CI: (", exp(beta.4 + c(-1,1)*1.96*se.4), ")\n")
+```
+
+\newpage
+# Model 5: Marginal Structural Cox Model
+```{r, cache=TRUE}
+## Set seed to ensure reproducibility of any stochastic procedures used
+## during model fitting
+set.seed(s)
+
+## Fit the marginal structural Cox model using stabilized inverse probability
+## weights (IPWs). The treatment-only model estimates the marginal treatment
+## effect in the IPW-defined pseudo-population.
+model.5 <- coxph(
+  Surv(time, Delta) ~ A,
+  data = data.set,
+  weights = ipw.stabilized,
+  robust = TRUE
+)
+
+## Extract the treatment coefficient and its robust standard error
+beta.5 <- coef(model.5)["A"]
+se.5 <- sqrt(diag(vcov(model.5))["A"])
+
+## Transform the treatment coefficient to the hazard ratio scale and calculate
+## the corresponding 95% Wald confidence interval
+cat("HR-hat:", exp(beta.5), "\n")
+cat("SE of HR-hat:", se.5, "\n")
+cat("95% CI: (", exp(beta.5 + c(-1,1)*1.96*se.5), ")\n")
+```
+
+\newpage
+# Model 6: IPW Case-Base Proportional Hazards Model
+```{r, cache=TRUE, warning=FALSE, message=FALSE}
+## Set seed to ensure reproducibility of the case-base sampling procedure
+set.seed(s)
+
+## Fit the modified smooth hazard model using case-base sampling and stabilized
+## IPWs. The custom FSH function incorporates the IPWs as observation-level
+## weights while accounting for the case-base sampling mechanism.
+model.6 <- FSH(
+  Delta ~ A,
+  data = data.set,
+  ratio = fsh.ratio,
+  w = ipw.stabilized
+)
+
+## Extract the treatment coefficient and calculate its heteroskedasticity-
+## consistent standard error
+beta.6 <- coef(model.6)["A"]
+se.6 <- sqrt(diag(vcovHC(model.6))["A"])
+
+## Transform the treatment coefficient to the hazard ratio scale and calculate
+## the corresponding 95% Wald confidence interval
+cat("HR-hat:", exp(beta.6), "\n")
+cat("SE of HR-hat:", se.6, "\n")
+cat("95% CI: (", exp(beta.6 + c(-1,1)*1.96*se.6), ")\n")
+```
+
+\newpage
+# Survival Curve Prediction Setup
+```{r, cache=TRUE}
+## Define the two treatment levels used to generate counterfactual survival
+## curves under no RHC (A = 0) and RHC (A = 1)
+trt.types <- c(0, 1)
+
+## Define the treatment profile used for individual-level prediction
+individual.profile.data <- data.frame(A = 1)
+
+## Create a prediction dataset containing both treatment levels for estimation
+## of the corresponding counterfactual survival curves
+survival.curves.data <- data.frame(A = trt.types)
+
+## Determine the maximum observed follow-up time and define the restricted
+## four-month follow-up period used for focused visualization
+tau.max <- max(data.set$time, na.rm = TRUE)
+t.max <- 150
+
+## Define the full follow-up grid and the restricted four-month grid
+tau.grid <- seq(0, tau.max, by = 1)
+t.grid <- seq(0, t.max, by = 1)
+```
+
+\newpage
+# Model 7: Unadjusted Case-Base Model with Time-Varying Hazard Ratio
+```{r, cache=TRUE, warning=FALSE, message=FALSE}
+## Set seed to ensure reproducibility of the case-base sampling procedure
+set.seed(s)
+
+## Fit an unadjusted case-base smooth hazard model allowing the treatment
+## effect to vary over time. The spline term models the baseline time effect,
+## while its interaction with treatment permits a non-constant hazard ratio.
+model.7 <- FSH(
+  Delta ~ pspline(time, df = 2) * A,
+  data = data.set,
+  ratio = fsh.ratio
+)
+```
+
+# Time-Varying Hazard Ratio: Full Follow-Up
+```{r, message=FALSE}
+## Display the estimated treatment hazard ratio as a function of follow-up
+## time, including its 95% confidence interval
+plot(
+  model.7,
+  type = "hr",
+  newdata = expand.grid(
+    time = tau.grid,
+    A = trt.types
+  ),
+  var = "A",
+  xvar = "time",
+  ci = TRUE,
+  ylim = c(0,2),
+  xlab="Time",
+  ylab="Hazard Ratio",
+  main="Model 7: Variable Hazard Ratio"
+)
+
+## Add a reference line corresponding to a hazard ratio of 1, representing
+## no instantaneous treatment effect
+abline(h = 1, col = "red", lty = 2)
+```
+
+# Time-Varying Hazard Ratio: First Four Months
+```{r}
+## Restrict the hazard-ratio plot to the first 150 days (approximately four
+## months) to provide a more detailed view of the early follow-up period
+plot(
+  model.7,
+  type = "hr",
+  newdata = expand.grid(
+    time = t.grid,
+    A = trt.types
+  ),
+  var = "A",
+  xvar = "time",
+  ci = TRUE,
+  ylim = c(1,1.5),
+  xlab="Time",
+  ylab="Hazard Ratio",
+  main="Model 7: Variable Hazard Ratio - First 4 Months"
+)
+
+## Add the no-effect reference line
+abline(h = 1, col = "red", lty = 2)
+```
+
+\newpage
+# Model 8: IPW Case-Base Model with Time-Varying Hazard Ratio
+```{r, cache=TRUE, warning=FALSE, message=FALSE}
+## Set seed to ensure reproducibility of the case-base sampling procedure
+set.seed(s)
+
+## Fit the IPW case-base smooth hazard model, allowing the treatment effect
+## to vary over time. Stabilized IPWs are incorporated through the modified
+## FSH function to estimate the treatment effect in the weighted
+## pseudo-population.
+model.8 <- FSH(
+  Delta ~ pspline(time, df = 2) * A,
+  data = data.set,
+  ratio = fsh.ratio,
+  w = ipw.stabilized
+)
+```
+
+# Time-Varying Hazard Ratio: Full Follow-Up
+```{r, message=FALSE}
+## Display the estimated time-varying treatment hazard ratio and its 95%
+## confidence interval over the full follow-up period
+plot(
+  model.8,
+  type = "hr",
+  newdata = expand.grid(
+    time = tau.grid,
+    A = trt.types
+  ),
+  var = "A",
+  xvar = "time",
+  ci = TRUE,
+  ylim = c(0,2),
+  xlab="Time",
+  ylab="Hazard Ratio",
+  main="Model 8: Variable Hazard Ratio"
+)
+
+## Add the no-effect reference line
+abline(h = 1, col = "red", lty = 2)
+```
+
+# Time-Varying Hazard Ratio: First Four Months
+```{r}
+## Restrict the hazard-ratio plot to the first 150 days to provide a more
+## detailed visualization of the early treatment effect
+plot(
+  model.8,
+  type = "hr",
+  newdata = expand.grid(
+    time = t.grid,
+    A = trt.types
+  ),
+  var = "A",
+  xvar = "time",
+  ci = TRUE,
+  ylim = c(1,1.5),
+  xlab="Time",
+  ylab="Hazard Ratio",
+  main="Model 8: Variable Hazard Ratio - First 4 Months"
+)
+
+## Add the no-effect reference line
+abline(h = 1, col = "red", lty = 2)
+```
+
+# Head-to-Head Comparison: Models 7 and 8
+```{r}
+## Extract the estimated time-varying treatment hazard ratios and their 95%
+## confidence intervals from the unadjusted and IPW-adjusted case-base models.
+## The resulting estimates are used to construct a common comparison plot.
+get.hr <- function(model) {
+  invisible(pdf(NULL))
+  
+  out <- plot(
+    model,
+    type = "hr",
+    newdata = data.frame(
+      time = tau.grid,
+      A = 0
+    ),
+    var = "A",
+    xvar = "time",
+    ci = TRUE
+  )
+  
+  invisible(dev.off())
+  
+  out
+}
+
+## Extract the time-varying hazard-ratio estimates from Models 7 and 8
+hr.7 <- get.hr(model.7)
+hr.8 <- get.hr(model.8)
+
+# Combined Hazard-Ratio Plot
+
+## Initialize an empty plotting region using the time and hazard-ratio ranges
+## from the extracted estimates. The curves and confidence intervals for both
+## models are added to this common plotting region below.
+plot(
+  hr.7$time,
+  hr.7$hazard_ratio,
+  type = "n",
+  ylim = c(0, 2),
+  xlab = "Time",
+  ylab = "Hazard Ratio",
+  main = "Head-to-head Comparison of Variable HR Models"
+)
+
+# 95% Confidence Intervals
+
+## Add the 95% confidence interval band for the unadjusted case-base model
+polygon(
+  c(hr.7$time, rev(hr.7$time)),
+  c(hr.7$lowerbound, rev(hr.7$upperbound)),
+  col = adjustcolor("red", alpha.f = 0.20),
+  border = NA
+)
+
+## Add the 95% confidence interval band for the IPW-adjusted case-base model
+polygon(
+  c(hr.8$time, rev(hr.8$time)),
+  c(hr.8$lowerbound, rev(hr.8$upperbound)),
+  col = adjustcolor("blue", alpha.f = 0.20),
+  border = NA
+)
+
+# Estimated Hazard-Ratio Curves
+
+## Overlay the estimated time-varying hazard-ratio curve from the unadjusted
+## case-base model
+lines(
+  hr.7$time,
+  hr.7$hazard_ratio,
+  col = "red",
+  lwd = 2
+)
+
+## Overlay the estimated time-varying hazard-ratio curve from the IPW-adjusted
+## case-base model
+lines(
+  hr.8$time,
+  hr.8$hazard_ratio,
+  col = "blue",
+  lwd = 2
+)
+
+# Reference Line and Legend
+
+## Add a horizontal reference line at HR = 1, corresponding to no difference
+## in the instantaneous hazard between treatment groups
+abline(
+  h = 1,
+  col = "black",
+  lty = 2
+)
+
+## Identify the two estimation approaches shown in the combined plot
+legend(
+  "bottomleft",
+  legend = c("Unadjusted", "IPW-Adjusted"),
+  col = c("red", "blue"),
+  lwd = 2,
+  bty = "n"
+)
+```
+
+\newpage
+# Restricted Mean Survival Time (RMST)
+```{r}
+## Numerically integrate a survival curve over the specified follow-up period
+## using the trapezoidal rule. The cumulative integral at each time point
+## represents the RMST up to that point.
+rmst.fn <- function(time, surv) {
+  dt <- diff(time)
+  mids <- (head(surv, -1) + tail(surv, -1)) / 2
+  c(0, cumsum(mids * dt))
+}
+```
+
+\newpage
+# MS-Cox RMST and Standard Error
+```{r}
+## Calculate the counterfactual RMST contrast and its standard error from the
+## marginal structural Cox model. The RMST contrast is defined as the
+## difference in restricted mean survival between RHC and no RHC.
+cox.rmst.list <- function(
+    ms.cox, t.grid, cox.psi.se, survival.curves.data 
+) {
+  
+  # Counterfactual Survival Curves
+  
+  ## Estimate the counterfactual survival curves under both treatment levels
+  ## from the fitted marginal structural Cox model
+  sf <- survfit(
+    ms.cox,
+    newdata = survival.curves.data
+  )
+  
+  ## Interpolate the counterfactual survival curve under no RHC onto the
+  ## specified time grid
+  S0 <- approx(
+    sf$time,
+    sf$surv[, 1],
+    t.grid,
+    method = "constant",
+    rule = 2
+  )$y
+  
+  ## Interpolate the counterfactual survival curve under RHC onto the
+  ## specified time grid
+  S1 <- approx(
+    sf$time,
+    sf$surv[, 2],
+    t.grid,
+    method = "constant",
+    rule = 2
+  )$y
+  
+  # RMST Contrast
+  
+  ## Calculate the RMST contrast as the difference between the restricted mean
+  ## survival under RHC and no RHC
+  cox.rmst <- rmst.fn(t.grid, S1) - rmst.fn(t.grid, S0)
+  
+  # Delta-Method Standard Error
+  
+  ## Construct the gradient of the RMST functional with respect to the
+  ## treatment log-hazard coefficient. For the Cox model, the derivative
+  ## involves the integral of S1(t) log{S1(t)} over the restriction period.
+  integrand <- ifelse(S1 > 0, S1 * log(S1), 0)
+  g.cox <- rmst.fn(t.grid, integrand)
+  
+  ## Propagate uncertainty from the estimated Cox treatment coefficient to the
+  ## RMST contrast using the delta method
+  cox.rmst.se <- abs(g.cox) * cox.psi.se
+  
+  return(list(
+    cox.rmst = cox.rmst,
+    cox.rmst.se = cox.rmst.se
+  ))
+}
+```
+
+\newpage
+# IPW Case-Base RMST and Standard Error
+```{r}
+## Calculate the RMST contrast and its standard error from the IPW case-base
+## model. The survival curves are reconstructed from the fitted model and the
+## variance of the RMST contrast is obtained using a numerical delta method.
+cb.rmst.list <- function(cb.ipw, cb.var, t.grid, constant.HR) {
+  
+  ## Extract the estimated model coefficients and the corresponding model
+  ## terms used to construct the design matrix
+  beta.hat <- coef(cb.ipw)
+  term.form <- delete.response(terms(cb.ipw))
+  
+  # Counterfactual Survival Function
+  
+  ## Construct the counterfactual survival function under treatment level a
+  ## directly from the case-base model's design matrix
+  cb.surv <- function(beta, a, grid) {
+    
+    ## Create prediction data over the specified time grid under treatment
+    ## level a
+    nd <- data.frame(
+      time = grid,
+      A = a,
+      offset = 0
+    )
+    
+    ## Construct the model matrix using the same terms as the fitted model and
+    ## align its columns with the estimated coefficient vector
+    X <- model.matrix(term.form, data = nd)
+    X <- X[, names(beta), drop = FALSE]
+    
+    ## Convert the linear predictor to the estimated hazard function
+    lambda <- exp(as.vector(X %*% beta))
+    
+    ## Numerically integrate the estimated hazard using the trapezoidal rule
+    ## to obtain the cumulative hazard
+    Lambda <- c(
+      0,
+      cumsum(
+        diff(grid) * (head(lambda, -1) + tail(lambda, -1)) / 2
+      )
+    )
+    
+    ## Convert cumulative hazard to survival probability
+    exp(-Lambda)
+  }
+  
+  # RMST Contrast
+  
+  ## Define the RMST contrast as a function of the model coefficient vector.
+  ## This function is subsequently used to obtain the numerical gradient
+  ## required for the delta-method standard error.
+  rmst.diff <- function(beta) {
+    rmst.fn(t.grid, cb.surv(beta, 1, t.grid)) -
+      rmst.fn(t.grid, cb.surv(beta, 0, t.grid))
+  }
+  
+  ## Evaluate the RMST contrast at the estimated model coefficients
+  cb.rmst <- rmst.diff(beta.hat)
+  
+  # Numerical Gradient
+  
+  ## Calculate the numerical gradient of the RMST contrast with respect to
+  ## each model coefficient using a central finite-difference approximation
+  p <- length(beta.hat)
+  m <- length(t.grid)
+  
+  grad <- matrix(NA_real_, nrow = m, ncol = p)
+  colnames(grad) <- names(beta.hat)
+  
+  ## Step size used for the finite-difference approximation
+  eps <- 1e-6
+  
+  ## Perturb each coefficient in turn and approximate the corresponding
+  ## derivative of the RMST contrast
+  for (j in seq_len(p)) {
+    bp <- bm <- beta.hat
+    bp[j] <- bp[j] + eps
+    bm[j] <- bm[j] - eps
+    
+    grad[, j] <- (rmst.diff(bp) - rmst.diff(bm)) / (2 * eps)
+  }
+  
+  # Delta-Method Standard Error
+  
+  ## Align the model covariance matrix with the coefficient ordering used by
+  ## the numerical gradient before applying the delta-method variance formula
+  cb.var <- cb.var[colnames(grad), colnames(grad), drop = FALSE]
+  
+  ## Calculate the RMST standard error at each restriction time using
+  ## Var{g(beta)} = grad' Var(beta) grad
+  cb.rmst.se <- vapply(
+    seq_len(m),
+    function(i) {
+      g <- grad[i, ]
+      sqrt(drop(t(g) %*% cb.var %*% g))
+    },
+    numeric(1)
+  )
+  
+  return(list(
+    cb.rmst = cb.rmst,
+    cb.rmst.se = cb.rmst.se
+  ))
+}
+``` 
+
+\newpage
+# Counterfactual Survival Curves: MS-Cox and IPW Case-Base Models
+
+# MS-Cox Counterfactual Survival Curves
+```{r, cache=TRUE}
+## Estimate counterfactual survival under both treatment levels using the
+## marginal structural Cox model. A = 0 corresponds to no RHC, while A = 1
+## corresponds to RHC.
+sf.cox <- survfit(
+  model.5,
+  newdata = survival.curves.data
+)
+
+## Interpolate the estimated survival curve under no RHC onto the common
+## time grid used for subsequent comparison and RMST calculation
+S0.cox <- approx(
+  sf.cox$time,
+  sf.cox$surv[, 1],
+  xout = tau.grid,
+  method = "constant",
+  rule = 2
+)$y
+
+## Interpolate the corresponding lower 95% confidence limit under no RHC
+S0.lower.cox <- approx(
+  sf.cox$time,
+  sf.cox$lower[, 1],
+  xout = tau.grid,
+  method = "constant",
+  rule = 2
+)$y
+
+## Interpolate the corresponding upper 95% confidence limit under no RHC
+S0.upper.cox <- approx(
+  sf.cox$time,
+  sf.cox$upper[, 1],
+  xout = tau.grid,
+  method = "constant",
+  rule = 2
+)$y
+
+## Interpolate the estimated survival curve under RHC onto the common time grid
+S1.cox <- approx(
+  sf.cox$time,
+  sf.cox$surv[, 2],
+  xout = tau.grid,
+  method = "constant",
+  rule = 2
+)$y
+
+## Interpolate the corresponding lower 95% confidence limit under RHC
+S1.lower.cox <- approx(
+  sf.cox$time,
+  sf.cox$lower[, 2],
+  xout = tau.grid,
+  method = "constant",
+  rule = 2
+)$y
+
+## Interpolate the corresponding upper 95% confidence limit under RHC
+S1.upper.cox <- approx(
+  sf.cox$time,
+  sf.cox$upper[, 2],
+  xout = tau.grid,
+  method = "constant",
+  rule = 2
+)$y
+```
+
+\newpage
+# IPW Case-Base Counterfactual Survival Curves
+```{r, cache=TRUE, message=FALSE, warning=FALSE}
+## Estimate counterfactual survival under no RHC and RHC using the IPW
+## case-base model over the common time grid
+Sf.cb <- absoluteRisk(
+  object = model.8,
+  time = tau.grid,
+  newdata = survival.curves.data,
+  type = "survival"
+)
+
+## Extract the estimated survival curves for no RHC and RHC, respectively
+S0.cb <- Sf.cb[, 2]
+S1.cb <- Sf.cb[, 3]
+
+# Bootstrap Confidence Intervals for the IPW Case-Base Curves
+
+## Use nonparametric bootstrap resampling to obtain pointwise confidence
+## intervals for the counterfactual survival curves estimated by the IPW
+## case-base model
+set.seed(s)
+n.boot <- 200
+
+## For each bootstrap sample, refit the IPW case-base model and obtain
+## counterfactual survival estimates under both treatment levels
+boot.surv <- replicate(n.boot, {
+  idx <- sample(nrow(data.set), replace = TRUE)
+  boot.data <- data.set[idx, ]
+  
+  boot.fit <- FSH(
+    Delta ~ pspline(time, df = 2) * A,
+    data = boot.data,
+    ratio = 10,
+    w = ipw.stabilized[idx]
+  )
+  
+  ar <- absoluteRisk(
+    boot.fit,
+    time = tau.grid,
+    newdata = survival.curves.data,
+    type = "survival"
+  )
+  
+  list(
+    S0 = ar[, 2],
+    S1 = ar[, 3]
+  )
+})
+
+## Organize the bootstrap estimates into separate matrices for the no-RHC
+## and RHC counterfactual survival curves
+S0.boot <- sapply(1:n.boot, function(i) boot.surv[["S0", i]])
+S1.boot <- sapply(1:n.boot, function(i) boot.surv[["S1", i]])
+
+## Calculate the pointwise lower 95% bootstrap confidence limit for the
+## no-RHC counterfactual survival curve
+S0.lower.cb <- apply(
+  S0.boot,
+  1,
+  quantile,
+  probs = 0.025,
+  na.rm = TRUE
+)
+
+## Calculate the pointwise upper 95% bootstrap confidence limit for the
+## no-RHC counterfactual survival curve
+S0.upper.cb <- apply(
+  S0.boot,
+  1,
+  quantile,
+  probs = 0.975,
+  na.rm = TRUE
+)
+
+## Calculate the pointwise lower 95% bootstrap confidence limit for the
+## RHC counterfactual survival curve
+S1.lower.cb <- apply(
+  S1.boot,
+  1,
+  quantile,
+  probs = 0.025,
+  na.rm = TRUE
+)
+
+## Calculate the pointwise upper 95% bootstrap confidence limit for the
+## RHC counterfactual survival curve
+S1.upper.cb <- apply(
+  S1.boot,
+  1,
+  quantile,
+  probs = 0.975,
+  na.rm = TRUE
+)
+```
+
+# Head-to-Head Comparison of Counterfactual Survival Curves
+```{r}
+## Compare the MS-Cox and IPW case-base estimates separately under each
+## treatment condition. The confidence bands are plotted first so that the
+## survival curves remain visible on top of the shaded regions.
+
+# Counterfactual Survival Under No RHC
+
+## Initialize the plotting region for the counterfactual survival curves
+## under no RHC (A = 0)
+plot(
+  tau.grid, S0.cox,
+  type = "n",
+  lwd = 2,
+  col = col.cox,
+  lty = 1,
+  ylim = c(0, 1),
+  xlab = "Time",
+  ylab = "Survival Probability",
+  main = "Counterfactual Survival Curves (No RHC)"
+)
+
+## Add the 95% confidence band for the MS-Cox survival estimate
+polygon(
+  c(tau.grid, rev(tau.grid)),
+  c(S0.lower.cox, rev(S0.upper.cox)),
+  col = fill.cox,
+  border = NA
+)
+
+## Add the 95% bootstrap confidence band for the IPW case-base survival
+## estimate
+polygon(
+  c(tau.grid, rev(tau.grid)),
+  c(S0.lower.cb, rev(S0.upper.cb)),
+  col = fill.cb,
+  border = NA
+)
+
+## Overlay the estimated survival curves. The MS-Cox curve is a step function,
+## whereas the case-base model produces a smooth survival curve.
+lines(S0.cox, type = "s", lwd = 2, col = col.cox, lty = 1)
+lines(S0.cb, type = "l", lwd = 2, col = col.cb, lty = 1)
+
+## Identify the two estimation approaches in the comparison plot
+legend(
+  "topright",
+  legend = c(
+    "Semi-Parametric: MS-Cox",
+    "Parametric: Case Base"
+  ),
+  col = c(
+    col.cox, col.cb
+  ),
+  lty = c(1, 1),
+  lwd = 2,
+  bty = "n"
+)
+
+# Counterfactual Survival Under RHC
+
+## Initialize the plotting region for the counterfactual survival curves
+## under RHC (A = 1)
+plot(
+  tau.grid, S1.cox,
+  type = "n",
+  lwd = 2,
+  col = col.cox,
+  lty = 1,
+  ylim = c(0, 1),
+  xlab = "Time",
+  ylab = "Survival Probability",
+  main = "Counterfactual Survival Curves (RHC)"
+)
+
+## Add the 95% confidence band for the MS-Cox survival estimate
+polygon(
+  c(tau.grid, rev(tau.grid)),
+  c(S1.lower.cox, rev(S1.upper.cox)),
+  col = fill.cox,
+  border = NA
+)
+
+## Add the 95% bootstrap confidence band for the IPW case-base survival
+## estimate
+polygon(
+  c(tau.grid, rev(tau.grid)),
+  c(S1.lower.cb, rev(S1.upper.cb)),
+  col = fill.cb,
+  border = NA
+)
+
+## Overlay the estimated survival curves under RHC
+lines(S1.cox, type = "s", lwd = 2, col = col.cox, lty = 1)
+lines(S1.cb, type = "l", lwd = 2, col = col.cb, lty = 1)
+
+## Identify the two estimation approaches in the comparison plot
+legend(
+  "topright",
+  legend = c(
+    "Semi-Parametric: MS-Cox",
+    "Parametric: Case Base"
+  ),
+  col = c(
+    col.cox, col.cb
+  ),
+  lty = c(1, 1),
+  lwd = 2,
+  bty = "n"
+)
+```
+
+\newpage
+# RMST Comparison: MS-Cox vs. IPW Case-Base
+
+# RMST Estimates and Standard Errors
+```{r, cache=TRUE}
+## Extract the robust standard error of the treatment log-hazard coefficient
+## from the marginal structural Cox model
+model.5.psi.se <- sqrt(diag(vcov(model.5))["A"])
+
+## Obtain the heteroskedasticity-consistent covariance matrix for the IPW
+## case-base model. This covariance matrix is used in the numerical
+## delta-method calculation of the RMST standard error.
+model.8.var <- cb.var <- vcovHC(model.8, type = "HC0")
+
+
+## Calculate the RMST contrast and its delta-method standard error for the
+## marginal structural Cox model
+cox.rmst.list <- cox.rmst.list(
+  model.5, tau.grid, model.5.psi.se, survival.curves.data
+)
+
+## Calculate the RMST contrast and its delta-method standard error for the
+## IPW case-base model
+cb.rmst.list <- cb.rmst.list(
+  model.8, model.8.var, tau.grid, constant.HR = TRUE
+)
+
+# Extract RMST Estimates and Standard Errors
+
+## Extract the estimated RMST contrasts and their corresponding standard errors
+## from both estimation approaches
+cox.rmst <- cox.rmst.list$cox.rmst
+cox.rmst.se <- cox.rmst.list$cox.rmst.se
+
+cb.rmst <- cb.rmst.list$cb.rmst
+cb.rmst.se <- cb.rmst.list$cb.rmst.se
+
+# Pointwise 95% Confidence Intervals
+
+## Construct pointwise 95% Wald confidence intervals for the MS-Cox RMST
+## contrast over the range of restriction times
+cox.lower <- cox.rmst - 1.96 * cox.rmst.se
+cox.upper <- cox.rmst + 1.96 * cox.rmst.se
+
+## Construct pointwise 95% Wald confidence intervals for the IPW case-base
+## RMST contrast over the range of restriction times
+cb.lower <- cb.rmst - 1.96 * cb.rmst.se
+cb.upper <- cb.rmst + 1.96 * cb.rmst.se
+```
+
+# RMST Comparison Plot
+```{r}
+## Determine a common y-axis range that accommodates the point estimates and
+## confidence intervals from both estimation approaches
+ylim <- range(
+  c(
+    cox.lower, cox.upper,
+    cb.lower, cb.upper
+  ),
+  na.rm = TRUE
+)
+
+## Initialize the plotting region for comparing the estimated causal RMST
+## contrasts over the full range of restriction times
+plot(
+  tau.grid, cox.rmst,
+  type = "n",
+  ylim = ylim,
+  xlab = expression(tau),
+  ylab = "RMST Difference",
+  main = "Causal RMST up to Tau"
+)
+
+# 95% Confidence Bands
+
+## Add the pointwise 95% confidence band for the MS-Cox RMST contrast
+polygon(
+  c(tau.grid, rev(tau.grid)),
+  c(cox.lower, rev(cox.upper)),
+  col = adjustcolor(col.cox, alpha.f = 0.2),
+  border = NA
+)
+
+## Add the pointwise 95% confidence band for the IPW case-base RMST contrast
+polygon(
+  c(tau.grid, rev(tau.grid)),
+  c(cb.lower, rev(cb.upper)),
+  col = adjustcolor(col.cb, alpha.f = 0.2),
+  border = NA
+)
+
+# RMST Contrast Estimates
+
+## Overlay the estimated causal RMST contrast from the MS-Cox model
+lines(tau.grid, cox.rmst, col = col.cox, lwd = 2)
+
+## Overlay the estimated causal RMST contrast from the IPW case-base model
+lines(tau.grid, cb.rmst, col = col.cb, lwd = 2)
+
+## Add a reference line at an RMST difference of zero, corresponding to equal
+## restricted mean survival under the two treatment conditions
+abline(h = 0, lty = 3)
+
+# Model Legend
+
+## Identify the two estimation approaches in the comparison plot
+legend(
+  "bottomleft",
+  legend = c("MS-Cox", "IPW Case-Base"),
+  col = c(col.cox, col.cb),
+  lwd = 2,
+  bty = "n"
+)
+```

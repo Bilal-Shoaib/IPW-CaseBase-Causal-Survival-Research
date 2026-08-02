@@ -1,4 +1,32 @@
----------------------------------------------------------------------   Marginal Estimate Plots   ---------------------------------------------------------------------------
+------------------------------------------------------------------------------   Introduction   ------------------------------------------------------------------------------
+
+Survival analysis is a statistical framework for studying the timing of events and their evolution over an observation period. It focuses on outcomes that unfold over time, where the event of interest may vary depending on the scientific context. A central challenge in this setting is that event times are often not fully observed, necessitating methods that appropriately incorporate incomplete follow-up information. This motivates a general emphasis on structuring time-to-event data in a manner that remains valid under varying patterns of observation and censoring. The primary quantities of interest characterize how event occurrence accumulates over time and how the associated risk evolves dynamically as individuals remain under observation. These quantities provide complementary perspectives on the evolution of survival experiences across populations and over time. Building on this foundation, survival analysis supports both descriptive summaries and modeling approaches that relate time-to-event behavior to explanatory factors, while relying on assumptions regarding the relationship between the observation process, censoring, and the underlying event-generating mechanism \citep{klein2003survival,kleinbaum1996survival}.
+
+The Kaplan--Meier estimator is a widely used non-parametric method for describing survival patterns in time-to-event data subject to censoring \citep{kaplan1958nonparametric}. It constructs an empirical survival function by sequentially updating survival probabilities at observed event times, resulting in a stepwise representation of the survival trajectory over time. This estimator naturally accommodates incomplete follow-up while maintaining an interpretable characterization of changes in survival experience across ordered event times. To compare survival patterns between groups, rank-based procedures are commonly employed to assess differences in event occurrences over time. These methods evaluate discrepancies between observed and expected event patterns under a common survival structure, providing a basis for assessing whether groups exhibit systematically different survival behavior \citep{mantel1966evaluation}. Extensions of these comparison procedures allow for alternative weighting schemes and adjustments for additional data structure, enabling more flexible comparisons across diverse survival settings \citep{harrington1982class}.
+
+The Cox proportional hazards model is a fundamental framework in survival analysis for examining the relationship between covariates and time-to-event outcomes \citep{cox1972regression}. Its semi-parametric structure allows for flexible modeling of survival processes while simultaneously adjusting for multiple explanatory variables. By focusing on relative hazard comparisons, the model provides a widely used approach for quantifying covariate effects through hazard ratios and adjusted survival estimates. Estimation is conducted using likelihood-based procedures that appropriately accommodate right-censored observations through the construction of time-evolving risk sets \citep{cox1972regression}. A central component of the framework is the proportional hazards assumption, which implies constancy of relative risks over the follow-up period. The model is also adaptable to a range of study designs and time scales, including settings with delayed entry, dynamic populations, and alternative definitions of the underlying survival timeline \citep{andersen1982cox}.
+
+Causal survival analysis is concerned with understanding how time-to-event outcomes would differ under alternative treatment assignments at the population level. The framework is based on counterfactual reasoning to compare hypothetical survival experiences, acknowledging that only one potential outcome is observed for each individual \citep{rubin1974estimating,hernan2020whatif}. Identification of causal effects relies on key structural assumptions, including consistency, conditional exchangeability, and positivity, which link observed data to the underlying potential outcomes \citep{robins1986new,hernan2020whatif}. Graphical causal structures (DAGs) are often used to represent confounding mechanisms and potential sources of informative censoring that may bias naive survival comparisons \citep{greenland1999causal,pearl2009causality}. Within this setting, marginal survival quantities and corresponding contrasts are the primary targets of inference. Estimation is typically achieved through standardization and inverse probability weighting strategies that construct pseudo-populations in which treatment groups are balanced with respect to observed covariates \citep{robins2000marginal,austin2011introduction}. Marginal structural survival models extend these ideas by combining weighted estimation with hazard-based modeling frameworks to estimate causal treatment effects in the presence of measured time-dependent confounding \citep{robins2000marginal}. In practice, their implementation requires careful evaluation of covariate balance, weight stability, and the plausibility of the underlying causal assumptions \citep{austin2011introduction,hernan2020whatif}.
+
+Case-base sampling provides a flexible framework for modeling time-to-event processes through the comparison of observed events with sampled time points across the follow-up period \citep{bhatnagar2020casebase}. By representing the study timeline through discrete person-time contributions, the approach facilitates the construction of a reference structure against which event occurrences can be evaluated \citep{bhatnagar2020casebase}. This formulation naturally incorporates time within the modeling process, thereby allowing a broad class of hazard functions to be represented within a unified framework \citep{bhatnagar2020casebase}. The methodology accommodates both parametric and semi-parametric specifications, including smooth functional forms that capture temporal variation in risk \citep{hanley2009fitting,bhatnagar2020casebase}. Through spline-based extensions, the framework can additionally be used to derive cumulative incidence measures and related risk summaries over time \citep{hanley2009fitting,bhatnagar2020casebase}. Comparisons with conventional survival modeling approaches suggest that case-base sampling can produce smooth and interpretable risk trajectories while maintaining close agreement with established methods \citep{bhatnagar2020casebase}.
+
+------------------------------------------------------------------------------   Assumptions   -------------------------------------------------------------------------------
+
+The non-informative censoring assumption states that the censoring mechanism provides no additional information about the remaining event time beyond that already captured by the observed treatment and covariates. In other words, conditional on $\X$ and $A$, the censoring process is independent of the potential outcome (or event time). Formally, this assumption is expressed as $T^{*} \perp C \mid \X, A$ \citep{robins1986new,hernan2020whatif}. This condition ensures that, after conditioning on $(A,\X)$, censoring does not introduce bias in the estimation of survival or hazard-related quantities \citep{hernan2020whatif,klein2003survival}.
+
+Consistency (SUTVA) states that the observed outcome for individual $i$ under the received treatment equals the corresponding potential outcome under that treatment, formally $T_i^* = T_i^*(A_i)$ \citep{rubin1974estimating,hernan2020whatif}. Consistency can be decomposed into two key conditions. The first is no interference, which requires that the potential outcome of unit $i$ depends only on its own treatment assignment and is unaffected by the treatment assignments of other units $j \neq i$. The second is the well-defined treatment condition, which requires that each treatment level corresponds to a single, unambiguous intervention; violations arise when heterogeneity in implementation renders $T^*(1)$ not uniquely defined \citep{hernan2020whatif}. Under SUTVA and appropriate adjustment for confounding, this framework implies an equivalence between conditional and potential outcome distributions within treatment strata, namely $\mathbb{P}\left(T^*(a) > t\right) = \mathbb{P}\left(T^* > t \mid A = a\right),$ within the stratum $\{A=a\}$ \citep{hernan2020whatif}.
+
+Conditional exchangeability states that, given a set of observed covariates $\X$, the treatment assignment provides no additional information about the potential outcomes. In other words, treatment assignment is ``as good as random'' within strata defined by $\X$ \citep{rubin1974estimating,hernan2020whatif}. Formally, this assumption is expressed as $T^{*}(a) \perp A \mid \X,\ \forall\, a \in \{0,1\}$. A key practical implication of this assumption is that all confounders of the relationship between $A$ and $T^{*}$ must be observed and included in $\X$. Under this condition, adjustment for $\X$ is sufficient to eliminate confounding bias in the estimation of treatment effects \citep{hernan2020whatif}.
+
+The positivity assumption requires that every covariate profile $\X = \X$ has a strictly positive probability of receiving each treatment level. Intuitively, this ensures that no subgroup defined by covariates is deterministically assigned to or excluded from a particular treatment. Formally, this condition is expressed as $0 < \mathbb{P}(A = a \mid \X = \X) < 1,\ \forall\, a \in \{0,1\}$ \citep{robins1986new,hernan2020whatif}. This assumption guarantees that treatment and control groups are adequately represented across all covariate strata, thereby enabling meaningful comparisons and identification of causal effects within each stratum \citep{hernan2020whatif}.
+
+A correctly specified propensity score model is one in which the estimated propensity score consistently recovers the true treatment assignment mechanism. Let $\hat{e}(\X)$ denote the estimated propensity score and let $e(\X) = \mathbb{P}(A=1 \mid \X)$ denote the true propensity score. The assumption of correct specification implies that $\hat{e}(\X) \xrightarrow{p} \mathbb{P}(A=1 \mid \X)$ as the sample size increases \citep{hernan2020whatif,austin2011introduction}. This condition ensures that the estimated propensity score is a consistent estimator of the true conditional probability of receiving treatment given covariates, thereby enabling valid adjustment for confounding in subsequent causal inference procedures \citep{austin2011introduction,hernan2020whatif}.
+
+Non-informative censoring, or a correctly specified inverse probability of censoring weight (IPCW) model, allows for unbiased estimation of the target estimand by appropriately accounting for the censoring mechanism. In particular, under the assumption of non-informative censoring, or when the censoring process is correctly specified, IPCW reweights the observed uncensored individuals to represent the full population that would have been observed in the absence of censoring \citep{robins1986new,hernan2020whatif}. This weighting scheme enables consistent estimation of functionals of $T^{*}$ despite the presence of censoring \citep{hernan2020whatif}.
+
+A correctly specified marginal structural Cox model (MS-Cox model) assumes that, at the population level, the hazard function is proportional in the treatment variable. This implies that the effect of treatment on the hazard is multiplicative and constant over time on the hazard ratio scale \citep{robins2000marginal,hernan2020whatif}. Consequently, the causal effect of treatment can be represented within a proportional hazards framework in the marginal (population-level) setting \citep{robins2000marginal}.
+
+---------------------------------------------------------------------   Marginal Estimate Plots   ----------------------------------------------------------------------------
 
 Figure \ref{fig:true_rmst_ss} presents the true marginal restricted mean survival time (RMST) difference curve used as the benchmark in the simulation study. The curve represents the true causal RMST difference over the follow-up period and serves as the reference against which the RMST estimates obtained from the MS-Cox and case-base models are evaluated in the subsequent analyses.
 
@@ -273,3 +301,228 @@ $\tau$ & Method & True RMST & Mean $\widehat{\text{RMST}}$
 \end{tabular}%
 }
 \end{table}
+
+
+--------------------------------------------------------------------------------- HR Plots -----------------------------------------------------------------------------------
+
+Figure \ref{fig:hr_errors_ss} presents the distributions of the hazard ratio estimation errors for the MS-Cox and case-base models, where the error is defined as the difference between the estimated and true marginal hazard ratio. For both methods, the error distributions are centred around zero, indicating that neither estimator exhibits systematic directional error across the simulation replicates and that positive and negative estimation errors occur with approximately equal frequency.
+
+% show hr errors
+\begin{figure}[htpb]
+    \centering
+     \includegraphics[width=0.8\textwidth]{Figures/Simulation Study/hr-errors.pdf}
+    \caption{HR Errors}
+    \label{fig:hr_errors_ss}
+\end{figure}
+
+-------------------------------------------------------------------------------- Table One -----------------------------------------------------------------------------------
+
+Table~\ref{tab1:original} summarizes the complete information from the original data set before any inverse probability weights are applied.
+
+% show table one
+\begin{table}[htbp]
+\centering
+\caption{Baseline characteristics in RHC dataset stratified by binary treatment exposure.}
+\label{tab1:original}
+\begin{tabular}{|l|cc|l|}
+  \hline
+Covariates & 0 & 1 & SMD \\ 
+  \hline
+$n = 5735$ &  3551 &  2184 &  \\ 
+  Gender = Male (\%) &  1914 (53.9)  &  1278 (58.5)  &  0.093 \\ 
+  Age (mean (SD)) & 61.76 (17.29) & 60.75 (15.63) &  0.061 \\ 
+  Weight (mean (SD)) & 65.04 (29.50) & 72.36 (27.73) &  0.256 \\ 
+  Race (\%) &   &   &  0.036 \\ 
+  \quad   White &  2753 (77.5)  &  1707 (78.2)  &  \\ 
+  \quad   Black &   585 (16.5)  &   335 (15.3)  &  \\
+  \quad   Other &   213 ( 6.0)  &   142 ( 6.5)  &  \\ 
+  Education (mean (SD)) & 11.57 (3.13) & 11.86 (3.16) &  0.091 \\ 
+  Income (\%) &   &   &  0.142 \\ 
+  \quad   Under \$11k &  2081 (58.6)  &  1145 (52.4)  &  \\ 
+  \quad   \$11-\$25k &   713 (20.1)  &   452 (20.7)  &  \\ 
+  \quad   \$25-\$50k &   500 (14.1)  &   393 (18.0)  &  \\ 
+  \quad   $>$ \$50k &   257 ( 7.2)  &   194 ( 8.9)  &  \\ 
+  InsuranceClass (\%) &   &   &  0.194 \\ 
+  \quad   No insurance &   186 ( 5.2)  &   136 ( 6.2)  &  \\ 
+  \quad   Private &   967 (27.2)  &   731 (33.5)  &  \\ 
+  \quad   Medicare &   947 (26.7)  &   511 (23.4)  &  \\ 
+  \quad   Medicaid &   454 (12.8)  &   193 ( 8.8)  &  \\ 
+  \quad   Private \& Medicare &   746 (21.0)  &   490 (22.4)  &  \\ 
+  \quad   Medicare \& Medicaid &   251 ( 7.1)  &   123 ( 5.6)  &  \\ 
+  CHFhx = Yes (\%) &   596 (16.8)  &   425 (19.5)  &  0.070 \\ 
+  CARDIOhx = Yes (\%) &   567 (16.0)  &   446 (20.4)  &  0.116 \\ 
+  DEMENThx = Yes (\%) &   413 (11.6)  &   151 ( 6.9)  &  0.163 \\ 
+  PSYCHhx = Yes (\%) &   286 ( 8.1)  &   100 ( 4.6)  &  0.143 \\ 
+  CHRPULhx = Yes (\%) &   774 (21.8)  &   315 (14.4)  &  0.192 \\ 
+  RENALhx = Yes (\%) &   149 ( 4.2)  &   106 ( 4.9)  &  0.032 \\ 
+  LIVERhx = Yes (\%) &   265 ( 7.5)  &   136 ( 6.2)  &  0.049 \\ 
+  GIBLEDhx = Yes (\%) &   131 ( 3.7)  &    54 ( 2.5)  &  0.070 \\ 
+  MALIGhx = Yes (\%) &   872 (24.6)  &   444 (20.3)  &  0.101 \\ 
+  IMMUNhx = Yes (\%) &   907 (25.5)  &   636 (29.1)  &  0.080 \\ 
+  TRANShx = Yes (\%) &   335 ( 9.4)  &   327 (15.0)  &  0.170 \\ 
+  AMIhx = Yes (\%) &   105 ( 3.0)  &    95 ( 4.3)  &  0.074 \\ 
+  Cancer (\%) &   &   &  0.107 \\ 
+  \quad   No &  2652 (74.7)  &  1727 (79.1)  &  \\ 
+  \quad   Yes &   638 (18.0)  &   334 (15.3)  &  \\ 
+  \quad   Metastatic &   261 ( 7.4)  &   123 ( 5.6)  &  \\ 
+  Category (\%) &   &   &  0.583 \\ 
+  \quad   ARF &  1581 (44.5)  &   909 (41.6)  &  \\ 
+  \quad   COPD &   399 (11.2)  &    58 ( 2.7)  &  \\ 
+  \quad   CHF &   247 ( 7.0)  &   209 ( 9.6)  &  \\ 
+  \quad   Cirrhosis &   175 ( 4.9)  &    49 ( 2.2)  &  \\ 
+  \quad   Coma &   341 ( 9.6)  &    95 ( 4.3)  &  \\ 
+  \quad   Colon Cancer &     6 ( 0.2)  &     1 ( 0.0)  &  \\ 
+  \quad   Lung Cancer &    34 ( 1.0)  &     5 ( 0.2)  &  \\ 
+  \quad   MOSF w/Malignancy &   241 ( 6.8)  &   158 ( 7.2)  &  \\ 
+  \quad   MOSF w/Sepsis &   527 (14.8)  &   700 (32.1)  &  \\
+  Severity (mean (SD)) & 20.37 (5.48) & 20.70 (5.03) &  0.063 \\ 
+   \hline
+\end{tabular}
+\end{table}
+
+Table~\ref{tab1:weighted} summarizes the complete information from the weighted data set after inverse probability weights are applied.
+
+% show table two
+{
+\begin{table}[htpb]
+\centering
+\small
+\caption{Weighted characteristics in RHC dataset stratified by binary treatment exposure.} 
+\label{tab1:weighted}
+\begin{tabular}{|l|cc|l|}
+  \hline
+Covariates & 0 & 1 & SMD \\ 
+  \hline
+$n=5733$ &  3554.6 &  2178.4 &  \\ 
+  Gender = Male (\%) &  1968.2 (55.4)  &  1209.5 (55.5)  &  0.003 \\ 
+  Age (mean (SD)) &   61.33 (17.24) &   61.25 (15.74) &  0.005 \\ 
+  Weight (mean (SD)) &   67.93 (29.11) &   68.23 (28.44) &  0.010 \\ 
+  Race (\%) &   &   &  0.007 \\ 
+  \quad   White &  2759.7 (77.6)  &  1694.1 (77.8)  &  \\ 
+  \quad   Black &   576.6 (16.2)  &   354.1 (16.3)  &  \\
+  \quad   Other &   218.3 ( 6.1)  &   130.1 ( 6.0)  &  \\ 
+  Education (mean (SD)) &   11.69 (3.14) &   11.69 (3.08) &  0.001 \\ 
+  Income (\%) &   &   &  0.001 \\ 
+  \quad   Under \$11k &  1997.5 (56.2)  &  1224.6 (56.2)  &  \\ 
+  \quad   \$11-\$25k &   723.4 (20.4)  &   443.7 (20.4)  &  \\ 
+  \quad   \$25-\$50k &   555.6 (15.6)  &   340.0 (15.6)  &  \\ 
+  \quad   $>$ \$50k &   278.1 ( 7.8)  &   170.0 ( 7.8)  &  \\ 
+  InsuranceClass (\%) &   &   &  0.031 \\ 
+  \quad   No insurance &   198.0 ( 5.6)  &   119.1 ( 5.5)  &  \\ 
+  \quad   Private &  1047.8 (29.5)  &   634.7 (29.1)  &  \\ 
+  \quad   Medicare &   899.1 (25.3)  &   550.6 (25.3)  &  \\ 
+  \quad   Medicaid &   404.3 (11.4)  &   267.6 (12.3)  &  \\ 
+  \quad   Private \& Medicare &   775.2 (21.8)  &   472.6 (21.7)  &  \\ 
+  \quad   Medicare \& Medicaid &   230.1 ( 6.5)  &   133.7 ( 6.1)  &  \\ 
+  CHFhx = Yes (\%) &   634.9 (17.9)  &   392.2 (18.0)  &  0.004 \\ 
+  CARDIOhx = Yes (\%) &   636.8 (17.9)  &   403.2 (18.5)  &  0.015 \\ 
+  DEMENThx = Yes (\%) &   347.5 ( 9.8)  &   206.1 ( 9.5)  &  0.011 \\ 
+  PSYCHhx = Yes (\%) &   237.3 ( 6.7)  &   146.1 ( 6.7)  &  0.001 \\ 
+  CHRPULhx = Yes (\%) &   669.0 (18.8)  &   411.0 (18.9)  &  0.001 \\ 
+  RENALhx = Yes (\%) &   161.7 ( 4.5)  &   103.3 ( 4.7)  &  0.009 \\ 
+  LIVERhx = Yes (\%) &   250.2 ( 7.0)  &   153.3 ( 7.0)  & $<$0.001 \\ 
+  GIBLEDhx = Yes (\%) &   114.7 ( 3.2)  &    69.0 ( 3.2)  &  0.003 \\ 
+  MALIGhx = Yes (\%) &   817.4 (23.0)  &   503.0 (23.1)  &  0.002 \\ 
+  IMMUNhx = Yes (\%) &   965.2 (27.2)  &   598.5 (27.5)  &  0.007 \\ 
+  TRANShx = Yes (\%) &   412.5 (11.6)  &   255.5 (11.7)  &  0.004 \\ 
+  AMIhx = Yes (\%) &   122.4 ( 3.4)  &    77.3 ( 3.5)  &  0.006 \\ 
+  Cancer (\%) &   &   &  0.002 \\ 
+  \quad   No &  2712.1 (76.3)  &  1659.9 (76.2)  &  \\ 
+  \quad   Yes &   603.9 (17.0)  &   371.9 (17.1)  &  \\ 
+  \quad   Metastatic &   238.5 ( 6.7)  &   146.5 ( 6.7)  &  \\ 
+  Category (\%) &   &   &  0.011 \\ 
+  \quad   ARF &  1541.0 (43.4)  &   948.6 (43.5)  &  \\ 
+  \quad   COPD &   282.7 ( 8.0)  &   170.5 ( 7.8)  &  \\ 
+  \quad   CHF &   282.7 ( 8.0)  &   173.3 ( 8.0)  &  \\ 
+  \quad   Cirrhosis &   138.6 ( 3.9)  &    85.6 ( 3.9)  &  \\ 
+  \quad   Coma &   270.2 ( 7.6)  &   164.7 ( 7.6)  &  \\ 
+  \quad   Colon Cancer &     4.4 ( 0.1)  &     3.4 ( 0.2)  &  \\ 
+  \quad   Lung Cancer &    24.1 ( 0.7)  &    14.2 ( 0.7)  &  \\ 
+  \quad   MOSF w/Malignancy &   246.5 ( 6.9)  &   150.6 ( 6.9)  &  \\ 
+  \quad   MOSF w/Sepsis &   764.4 (21.5)  &   467.4 (21.5)  &  \\
+  Severity (mean (SD)) &   20.48 (5.53) &   20.55 (4.95) &  0.013 \\ 
+   \hline
+\end{tabular}
+\end{table}
+}
+
+------------------------------------------------------------------------------- Variable HR ----------------------------------------------------------------------------------
+
+\subsubsection{Variable Hazard Ratios}
+Figure~\ref{fig:unadjusted_varHR} displays the estimated time-varying hazard ratio from Model 7. The estimated hazard ratio remains below 1 throughout the observed follow-up period, indicating a consistently lower hazard in the exposed group relative to the reference group. However, it increases and approaches 1 around day 1500, suggesting a temporary attenuation of the treatment effect. This is followed by a sharp decline to approximately 0.5, after which the hazard ratio gradually increases over time until the end of the observation period.
+
+% show variable hr plot
+\begin{figure}[htpb]
+    \centering
+    \includegraphics[width=1\textwidth]{Figures/Application/unadjusted-varHR.pdf}
+    \caption{Model 7: Time dependent Hazard Ratio}
+    \label{fig:unadjusted_varHR}
+\end{figure}
+
+Figure~\ref{fig:varHR} illustrates the estimated time-varying hazard ratio from Model 8. The hazard ratio remains below 1 for most of the follow-up period and exhibits a gradual decrease over time, indicating that the treatment is associated with a reduced risk of the event and therefore has a protective effect for patients. Moreover, the decreasing trend suggests that this beneficial effect becomes stronger as time progresses, with the treatment conferring increasing relative risk reduction in later follow-up periods. This pattern departs from the proportional hazards assumption, which would otherwise imply a constant treatment effect over time.
+
+The figure also shows widening 95\% confidence intervals as time progresses. This increase in uncertainty is driven by the progressive reduction in the size of the risk set due to event occurrence and censoring. As fewer individuals remain under observation at later time points, the amount of information available for estimation decreases, leading to greater variability in the estimated hazard ratio. This effect is particularly pronounced towards the tail of the follow-up period, where the risk set becomes small and estimates are consequently more sensitive to stochastic fluctuations.
+
+% show variable hr plot
+\begin{figure}[htpb]
+    \centering
+    \includegraphics[width=1\textwidth]{Figures/Application/varHR.pdf}
+    \caption{Model 8: Time dependent Hazard Ratio}
+    \label{fig:varHR}
+\end{figure}
+
+------------------------------------------------------------------------------- RMST Curves ----------------------------------------------------------------------------------
+
+\subsubsection{RMST Plots}
+Figure \ref{fig:cox_rmst_ss} compares the restricted mean survival time (RMST) curves estimated using the marginal structural Cox (MS-Cox) model with the corresponding true RMST curves. Overall, the MS-Cox estimator provides a close approximation to the true RMST trajectories across most of the follow-up period, indicating that the model adequately captures the underlying treatment-specific survival experience. Noticeable divergence between the estimated and true curves occurs only toward the end of the time horizon, where the estimated curves begin to fan out. This behavior is expected, as the effective sample size decreases at later follow-up times because of censoring and accumulated events, resulting in increased standard errors and greater estimation variability. Consequently, the larger discrepancies observed in the tail of the curves are consistent with the reduced precision of the RMST estimates in this region rather than evidence of systematic model bias. (Results shown correspond to the third data-generating setting with $\beta_A = 0.5$ and $n = 1000$.)
+
+
+% show cox rmst curves
+\begin{figure}[htpb]
+    \centering
+     \includegraphics[width=0.9\textwidth]{Figures/Simulation Study/cox-rmst.pdf}
+    \caption{MS-Cox: RMST Curves}
+    \label{fig:cox_rmst_ss}
+\end{figure}
+
+Figure \ref{fig:cb_rmst_ss} compares the restricted mean survival time (RMST) curves estimated using the case-base model with the corresponding true RMST curves. Similar to the marginal structural Cox (MS-Cox) model, the case-base estimator closely tracks the true RMST trajectories throughout the majority of the follow-up period, demonstrating excellent agreement with the underlying treatment-specific survival experience. The estimated and true curves exhibit only minor divergence near the end of the follow-up period, where the curves begin to fan out as a consequence of increased estimation variability. This pattern reflects the diminishing effective sample size at later times due to censoring and accumulated events, which results in larger standard errors and reduced precision in the RMST estimates.
+
+% show cb rmst curves
+\begin{figure}[htpb]
+    \centering
+     \includegraphics[width=0.9\textwidth]{Figures/Simulation Study/cb-rmst.pdf}
+    \caption{Case Base: RMST Curves}
+    \label{fig:cb_rmst_ss}
+\end{figure}
+
+---------------------------------------------------------------------- Counterfactual Survival Curves ------------------------------------------------------------------------
+
+Figure~\ref{fig:survIndividual} compares the estimated survival curves for an average individual under the marginal structural Cox model and the inverse probability weighted case-base model. The two curves are virtually indistinguishable across the entire follow-up period, closely mirroring each other in both shape and trajectory. This strong agreement suggests that, despite being based on different modelling frameworks and estimation strategies, both approaches yield consistent estimates of the underlying survival function when appropriately adjusted for confounding through weighting. The near-overlap of the curves provides reassuring evidence of robustness in the estimated treatment effect and indicates that both methods capture the same underlying temporal pattern in survival.
+
+% show individual survival curves
+\begin{figure}[htpb]
+    \centering
+    \includegraphics[width=1\textwidth]{Figures/Application/individual-sc.pdf}
+    \caption{Survival Curves for the Average Individual}
+    \label{fig:survIndividual}
+\end{figure}
+
+Figure~\ref{fig:coxcsc} shows the estimated counterfactual survival curves for the two treatment groups: RHC performed ($A = 1$) and RHC not performed ($A = 0$). Counterfactual survival was estimated using a multi-state Cox (ms-Cox) model with inverse probability weighting (IPW). The estimated curves have virtually identical shapes over time, indicating similar temporal dynamics in survival under both treatment regimes. However, the untreated group ($A = 0$) consistently exhibits higher estimated survival probabilities throughout the follow-up period, as reflected by the approximately constant separation between the two curves.
+
+% Add Cox PH csc
+\begin{figure}[htpb]
+    \centering
+    \includegraphics[width=1\textwidth]{Figures/Application/cox-csc.pdf}
+    \caption{Cox PH Counterfactual Survival Curves}
+    \label{fig:coxcsc}
+\end{figure}
+
+Figure~\ref{fig:cbcsc} shows the estimated counterfactual survival curves for the two treatment groups: RHC performed ($A = 1$) and RHC not performed ($A = 0$). The estimated curves exhibit similar overall temporal patterns in survival under both treatment regimes. During the early and intermediate follow-up period, the untreated group ($A = 0$) consistently displays higher estimated survival probabilities than the treated group ($A = 1$). However, after approximately 1,000 days of follow-up, the curves cross, and the treated group ($A = 1$) exhibits slightly higher estimated survival probabilities for the remainder of the follow-up period. This crossover suggests that the estimated survival advantage shifts from the untreated group in the short term to the treated group in the longer term.
+
+% Add Case Base csc
+\begin{figure}[htpb]
+    \centering
+    \includegraphics[width=1\textwidth]{Figures/Application/cb-csc.pdf}
+    \caption{Case Base Counterfactual Survival Curves}
+    \label{fig:cbcsc}
+\end{figure}
