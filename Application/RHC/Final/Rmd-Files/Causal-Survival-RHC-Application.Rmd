@@ -1,5 +1,5 @@
 ---
-title: "Causal Survival - RHC Application"
+title: "Causal Survival - RHC Application - IPCW"
 output: pdf_document
 date: "2026-05-31"
 ---
@@ -9,476 +9,812 @@ knitr::opts_chunk$set(echo = TRUE)
 ```
 
 \newpage
-# Package Imports
-
-### EDA
-```{r, warning=FALSE, message=FALSE}
-library("Hmisc")
-library("tableone")
-library("xtable")
-library("ggplot2")
-library("survey")
-library("cobalt")
-```
-
-### Estimation
-```{r, warning=FALSE, message=FALSE}
-library("survival")
-library("casebase")
-library("sandwich")
-library("foreach")
-library("doParallel")
-```
-
-\newpage
-# Data Preparation
+# Design by Contract
 ```{r}
-## Set random seed for reproducibility
-s = 123
-
-## Load the Right Heart Catheterization (RHC) dataset
-getHdata(rhc)
-```
-
-# Primary Analysis Variables
-```{r, cache=TRUE}
-## Define follow-up time as the time from hospital admission to the last
-## available contact or death date
-time <- as.numeric(
-  pmax(rhc$dthdte, rhc$lstctdte, na.rm = TRUE) - rhc$sadmdte
-)
-
-## Define the binary event indicator:
-## 1 = death, 0 = censored
-Delta <- ifelse(
-  rhc$death == "Yes",
-  1,
-  0
-)
-
-## Define the binary treatment indicator:
-## 1 = right heart catheterization (RHC) performed, 0 = not performed
-A <- ifelse(
-  rhc$swang1 == "RHC",
-  1,
-  0
-)
-```
-
-\newpage
-# Baseline Covariates
-```{r}
-### Demographic and Socioeconomic Characteristics
-
-## Patient sex
-Gender <- rhc$sex
-
-## Patient age at baseline
-Age <- as.numeric(rhc$age)
-
-## Patient weight in kilograms
-## Note: The original dataset encodes some missing values as 0. These values
-## are retained because replacing them with NA substantially alters the
-## estimated propensity scores and covariate balance following weighting.
-Weight <- as.numeric(rhc$wtkilo1)
-
-## Patient race
-Race <- droplevels(rhc$race)
-
-## Educational attainment
-Education <- as.numeric(rhc$edu)
-
-## Income category
-Income <- rhc$income
-
-## Insurance classification
-InsuranceClass <- rhc$ninsclas
-
-
-### Pre-existing Comorbidities
-
-## Names of baseline comorbidity variables to be recoded
-hx.vars <- c(
-  "chfhx",
-  "cardiohx",
-  "dementhx",
-  "psychhx",
-  "chrpulhx",
-  "renalhx",
-  "liverhx",
-  "gibledhx",
-  "malighx",
-  "immunhx",
-  "transhx",
-  "amihx"
-)
-
-## Convert labelled comorbidity variables to binary factors:
-## "No" = absence of comorbidity, "Yes" = presence of comorbidity
-rhc[hx.vars] <- lapply(rhc[hx.vars], function(x) {
-  x <- as.numeric(x)
+stop.running <- function(condition, message) {
   
-  factor(
-    ifelse(x == 1, "Yes", "No"),
-    levels = c("No", "Yes")
+  this.function.name <- rlang::call_name(rlang::current_call())
+  
+  if (is.null(condition)) {
+    stop(paste0(this.function.name, ": condition must not be NULL"))
+  }
+  if (is.null(message)) {
+    stop(paste0(this.function.name, ": message must not be NULL"))
+  }
+  if (!condition) {
+    stop(message)
+  }
+}
+
+contract <- function(condition, message) {
+  
+  this.function.name <- rlang::call_name(rlang::current_call())
+  
+  stop.running(
+    condition = !missing(condition),
+    message = paste0(this.function.name, ": condition must not be missing")
   )
-})
+  stop.running(
+    condition = !is.null(message),
+    message = paste0(this.function.name, ": message must not be NULL")
+  )
+  stop.running(
+    condition = is.character(message),
+    message = paste0(this.function.name, ": message must be a character string")
+  )
+  stop.running(
+    condition = length(message) == 1,
+    message = paste0(this.function.name, ": message must be a single string")
+  )
 
-## Extract recoded comorbidity variables for the analysis dataset
-CHFhx <- rhc$chfhx
-CARDIOhx <- rhc$cardiohx
-DEMENThx <- rhc$dementhx
-PSYCHhx <- rhc$psychhx
-CHRPULhx <- rhc$chrpulhx
-RENALhx <- rhc$renalhx
-LIVERhx <- rhc$liverhx
-GIBLEDhx <- rhc$gibledhx
-MALIGhx <- rhc$malighx
-IMMUNhx <- rhc$immunhx
-TRANShx <- rhc$transhx
-AMIhx <- rhc$amihx
+  return(
+    structure(
+      list(
+        expr = substitute(condition),
+        message = message
+      ),
+      class = "contract"
+    )
+  )
+}
 
+DbC <- function(contracts) {
+  
+  this.function.name <- rlang::call_name(rlang::current_call())
+  function.name <- rlang::call_name(rlang::caller_call())
+  
+  stop.running(
+    condition = !is.null(contracts),
+    message = paste0(this.function.name, ": contracts must not be NULL")
+  )
+  stop.running(
+    condition = is.list(contracts),
+    message = paste0(this.function.name, ": contracts must be a list")
+  )
+  stop.running(
+    condition = length(contracts) > 0,
+    message = paste0(
+      this.function.name,
+      ": there must be at least one condition to check"
+    )
+  )
+  stop.running(
+    condition = all(vapply(contracts, inherits, logical(1), what = "contract")),
+    message = paste0(
+      this.function.name,
+      ": every element of contracts must be built with contract()"
+    )
+  )
 
-### Disease Severity and Clinical Characteristics
-
-## Indicator of cancer diagnosis
-Cancer <- rhc$ca
-
-## Primary disease category
-Category <- droplevels(rhc$cat1)
-
-## Baseline disease severity score
-Severity <- as.numeric(rhc$das2d3pc)
+  for (i in seq_along(contracts)) {
+    stop.running(
+      condition = eval(contracts[[i]]$expr, envir = parent.frame()),
+      message = paste0(function.name, ": ", contracts[[i]]$message)
+    )
+  }
+}
 ```
 
 \newpage
-# Construct Analysis Dataset
+# Construct Dataset Function (RHC)
 ```{r}
-## Combine the outcome, treatment, and baseline covariates into a single
-## analysis-ready dataset
-data.set <- data.frame(
-  time = time,
-  Delta = Delta,
-  A = A,
+construct_data_set <- function() {
+  Hmisc::getHdata(rhc)
+  # primary analysis variables
+  time <- pmax(rhc$dthdte, rhc$lstctdte, na.rm = TRUE) - rhc$sadmdte
+  Delta <- ifelse(rhc$death == "Yes",1,0)
+  C <- 1 - Delta
+  A <- ifelse(rhc$swang1 == "RHC",1,0)
   
-  Gender = Gender,
-  Age = Age,
-  Weight = Weight,
-  Race = Race,
-  Education = Education,
-  Income = Income,
-  InsuranceClass = InsuranceClass,
+  # demographic and socioeconomic characteristics
+  Gender <- rhc$sex
+  Age <- as.numeric(rhc$age)
+  Race <- droplevels(rhc$race)
+  Education <- as.numeric(rhc$edu)
+  Income <- rhc$income
+  InsuranceClass <- rhc$ninsclas
+  ## Patient weight in kilograms
+  ## Note: The original dataset encodes some missing values as 0. These values
+  ## are retained because replacing them with NA substantially alters the
+  ## estimated propensity scores and covariate balance following weighting.
+  Weight <- as.numeric(rhc$wtkilo1)
   
-  CHFhx = CHFhx,
-  CARDIOhx = CARDIOhx,
-  DEMENThx = DEMENThx,
-  PSYCHhx = PSYCHhx,
-  CHRPULhx = CHRPULhx,
-  RENALhx = RENALhx,
-  LIVERhx = LIVERhx,
-  GIBLEDhx = GIBLEDhx,
-  MALIGhx = MALIGhx,
-  IMMUNhx = IMMUNhx,
-  TRANShx = TRANShx,
-  AMIhx = AMIhx,
+  # pre-existing comorbodities
+  hx.vars <- grep("hx$", names(rhc), value = TRUE)
+  rhc[hx.vars] <- lapply(rhc[hx.vars], function(x) {
+    x <- as.numeric(x)
   
-  Cancer = Cancer,
-  Category = Category,
-  Severity = Severity
-)
-```
-
-# Plotting Parameters
-```{r}
-## Define colours used to distinguish the marginal structural Cox model
-## and the case-base model in survival and hazard ratio plots
-col.cox <- "red"
-col.cb <- "blue"
-
-## Define semi-transparent fill colours for confidence interval bands
-fill.cox <- rgb(1,0,0,0.20)
-fill.cb  <- rgb(0,0,1,0.20)
-
-## Define semi-transparent colours for the exposed and control treatment groups
-col.exposed <- rgb(0,0,1,0.5)
-col.control <- rgb(1,0,0,0.5)
+    factor(
+      ifelse(x == 1, "Yes", "No"),
+      levels = c("No", "Yes")
+    )
+  })
+  
+  HX.Variables <- rhc[hx.vars]
+  names(HX.Variables) <- paste0(
+    toupper(sub("hx$", "", names(HX.Variables))),
+    "hx"
+  )
+  
+  # clinical characteristics
+  Cancer <- rhc$ca
+  Category <- droplevels(rhc$cat1)
+  Severity <- as.numeric(rhc$das2d3pc)
+  
+  # construct data set
+  data.set <- data.frame(
+    time = time,
+    Delta = Delta,
+    C = C,
+    A = A,
+    
+    Gender = Gender,
+    Age = Age,
+    Weight = Weight,
+    Race = Race,
+    Education = Education,
+    Income = Income,
+    InsuranceClass = InsuranceClass,
+    
+    HX.Variables,
+    
+    Cancer = Cancer,
+    Category = Category,
+    Severity = Severity
+  )
+  
+  #-----------------------------------  POST   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.data.frame(data.set),
+        "construct_data_set: data.set must be a data.frame"
+      ),
+      contract(
+        is.data.frame(data.set),
+        "construct_data_set: data.set must be a data.frame"
+      ),
+      contract(
+        nrow(data.set) > 0,
+        "construct_data_set: data.set has zero rows"
+      ),
+      contract(
+        all(c("time", "Delta", "C", "A") %in% names(data.set)),
+        "construct_data_set: missing required columns time/Delta/C/A"
+      ),
+      contract(
+        !any(is.na(data.set$time)) && all(data.set$time >= 0),
+        "construct_data_set: time must be non-negative and non-missing"
+      ),
+      contract(
+        all(data.set$Delta %in% c(0, 1)),
+        "construct_data_set: Delta must be binary 0/1"
+      ),
+      contract(
+        all(data.set$C %in% c(0, 1)),
+        "construct_data_set: C must be binary 0/1"
+      ),
+      contract(
+        all(data.set$A %in% c(0, 1)),
+        "construct_data_set: A must be binary 0/1"
+      )
+    )
+  )
+  #-----------------------------------  POST   --------------------------------#
+  
+  return(data.set)
+}
 ```
 
 \newpage
-# Propensity Score Estimation
+# Propensity Score Formula Function
 ```{r}
-## Set seed to ensure reproducibility of any downstream procedures involving
-## randomization or resampling
-set.seed(s)
+propensity_score_form <- function(
+    data.set, covariates, outcome, additional = ""  
+  ) {
 
-## Estimate the propensity score, defined as the probability of receiving
-## treatment conditional on the observed baseline covariates
-propensity.score <- fitted(
-  glm(
-    A ~ Gender +
-      Age +
-      Weight +
-      Race +
-      Education +
-      Income +
-      InsuranceClass +
-      CHFhx +
-      CARDIOhx +
-      DEMENThx +
-      PSYCHhx +
-      CHRPULhx +
-      RENALhx +
-      LIVERhx +
-      GIBLEDhx +
-      MALIGhx +
-      IMMUNhx +
-      TRANShx +
-      AMIhx + 
-      Cancer + 
-      Category + 
-      Severity,
+  #-----------------------------------   PRE   --------------------------------#  
+  DbC(
+    contracts = list(
+      contract(
+        is.data.frame(data.set),
+        "data.set must be a data.frame"
+      ),
+      contract(
+        is.character(covariates),
+        "covariates must be a character vector"
+      ),
+      contract(
+        length(covariates) > 0,
+        "covariates must be non-empty"
+      ),
+      contract(
+        all(covariates %in% names(data.set)),
+        "all covariates must be columns of data.set"
+      ),
+      contract(
+        is.character(outcome),
+        "outcome must be a character string"
+      ),
+      contract(
+        length(outcome) == 1,
+        "outcome must be a single string"
+      ),
+      contract(
+        outcome %in% names(data.set),
+        "outcome must be a column of data.set"
+      ),
+      contract(
+        is.character(additional),
+        "additional must be a character vector"
+      ),
+      contract(
+        !any(additional != "" & !(additional %in% names(data.set))),
+        "additional must reference columns of data.set"
+      )
+    )
+  )
+  #-----------------------------------   PRE   --------------------------------#
+  
+  all.covariates <- c(
+    covariates,
+    additional[additional != ""]
+  )
+
+  continuous <- vapply(
+    all.covariates,
+    function(covariate) {
+
+      x <- data.set[[covariate]]
+
+      if (!is.numeric(x) || is.integer(x)) {
+        return(FALSE)
+      }
+
+      x <- x[!is.na(x)]
+
+      non.integer.values <- unique(
+        x[x != trunc(x)]
+      )
+
+      length(non.integer.values) >= nrow(data.set) * 0.1
+    },
+    logical(1)
+  )
+
+  cont.covariates <- all.covariates[continuous]
+  non.cont.covariates <- all.covariates[!continuous]
+
+  spline.terms <- paste0(
+    "splines::ns(",
+    cont.covariates,
+    ", df = 2)"
+  )
+
+  linear.terms <- non.cont.covariates
+
+  rhs.terms <- c(
+    spline.terms,
+    linear.terms
+  )
+  
+  result <- as.formula(
+    paste(
+      outcome,
+      "~ 0 +",
+      paste(rhs.terms, collapse = " + ")
+    )
+  )
+  
+  #-----------------------------------  POST   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        inherits(result, "formula"),
+        "failed to construct a valid formula"
+      ),
+      contract(
+        outcome %in% all.vars(result),
+        "formula must contain the outcome variable"
+      ),
+      contract(
+        all(all.covariates %in% all.vars(result)),
+        "formula must contain all covariates and additional variables"
+      )   
+    )
+  )
+  #-----------------------------------  POST   --------------------------------#
+
+  return(result)
+}
+```
+
+\newpage
+# Propensity Score Function
+```{r}
+propensity_score <- function(
+    data.set,
+    outcome, covariates,
+    propensity.score.form,
+    additional = ""  
+  ) {
+  
+  #-----------------------------------   PRE   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.data.frame(data.set),
+        "data.set must be a data.frame"
+      ),
+      contract(
+        is.character(outcome) && length(outcome) == 1,
+        "outcome must be a single string"
+      ),
+      contract(
+        outcome %in% names(data.set),
+        "outcome must be a column of the data set"
+      ),
+      contract(
+        is.character(covariates) && length(covariates) > 0,
+        "covariates must be a non-empty string vector"
+      ),
+      contract(
+        all(covariates %in% names(data.set)),
+        "covariates must be columns of the data set"
+      ),
+      contract(
+        is.function(propensity.score.form),
+        "propensity.score.form must be a function"
+      ),
+      contract(
+        is.character(additional),
+        "additional must be a string vector"
+      ),
+      contract(
+        !any(additional != "" & !(additional %in% names(data.set))),
+        "additional must reference columns of the data set"
+      )
+    )
+  )
+  #-----------------------------------   PRE   --------------------------------#
+  
+  formula <- propensity.score.form(
+    data.set = data.set,
+    covariates = covariates,
+    outcome = outcome,
+    additional = additional
+  )
+  
+  result <- fitted(
+    glm(
+      formula = formula,
+      data = data.set,
+      family = binomial(link = "logit")
+    )
+  )
+  
+  #-----------------------------------  POST   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.numeric(result) && all(result >= 0 & result <= 1, na.rm = TRUE),
+        "propensity scores must be numeric values between 0 and 1"
+      )   
+    )
+  )
+  #-----------------------------------  POST   --------------------------------#
+  
+  # return the fitted propensity score model
+  return(result)
+}
+```
+
+\newpage
+# Plot Propensity Score Function
+```{r}
+plot_propensity_scores <- function(
+    propensity.score.0, propensity.score.1,
+    cols, fills,
+    title = "Propensity Score Overlap"
+  ) {
+  
+  #-----------------------------------   PRE   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.numeric(propensity.score.0),
+        "propensity.score.0 must be numeric"
+      ),
+      contract(
+        all(
+          propensity.score.0 >= 0 &
+          propensity.score.0 <= 1,
+          na.rm = TRUE
+        ),
+        "propensity.score.0 must contain values between 0 and 1"
+      ),
+      contract(
+        is.numeric(propensity.score.1),
+        "propensity.score.1 must be numeric"
+      ),
+      contract(
+        all(
+          propensity.score.1 >= 0 &
+          propensity.score.1 <= 1,
+          na.rm = TRUE
+        ),
+        "propensity.score.1 must contain values between 0 and 1"
+      ),
+      contract(
+        is.character(cols),
+        "cols must be a character vector"
+      ),
+      contract(
+        length(cols) >= 2,
+        "cols must contain at least two elements"
+      ),
+      contract(
+        is.character(fills),
+        "fills must be a character vector"
+      ),
+      contract(
+        length(fills) >= 2,
+        "fills must contain at least two elements"
+      ),
+      contract(
+        is.character(title) && length(title) == 1,
+        "title must be a single string"
+      )
+    )
+  )
+  #-----------------------------------   PRE   --------------------------------#
+  
+  par(
+    mar = c(2,2,2,0)
+  )
+  
+  # plot propensity scores for individuals with A == 0
+  hist(
+    propensity.score.0,
+    col = fills[1],
+    breaks = seq(0,1,by=0.02),
+    ylim = c(0,200),
+    main = title,
+    xlab = "Propensity Scores"
+  )
+  
+  # plot propensity scores for individuals with A == 1
+  hist(
+    propensity.score.1,
+    col = fills[2],
+    breaks = seq(0,1,by=0.02),
+    add = T
+  )
+  
+  box()
+  
+  legend(
+    "topright",
+    legend = c('A = 0', 'A = 1'),
+    fill = cols,
+    border = "black",
+    bty = "n"
+  )
+}
+```
+
+\newpage
+# Stabilized IPW Function
+```{r}
+stabilized_IPW <- function(propensity.score, outcome) {
+  
+  #-----------------------------------   PRE   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.numeric(propensity.score),
+        "propensity.score must be numeric"
+      ),
+      contract(
+        is.numeric(outcome),
+        "outcome must be numeric"
+      ),
+      contract(
+        length(propensity.score) == length(outcome),
+        "propensity.score and outcome must have the same length"
+      ),
+      contract(
+        all(propensity.score >= 0 & propensity.score <= 1, na.rm = TRUE),
+        "propensity.score must contain values between 0 and 1"
+      ),
+      contract(
+        all(outcome %in% c(0, 1)),
+        "outcome must contain only 0 and 1"
+      )
+    )
+  )
+  #-----------------------------------   PRE   --------------------------------#
+  
+  p.mean <- mean(outcome)
+  
+  # calculate stabilized ipws
+  ipw.stabilized <- ifelse(
+    outcome == 1,
+    p.mean / propensity.score,
+    (1 - p.mean) / (1 - propensity.score)
+  )
+  
+  #-----------------------------------  POST   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.numeric(ipw.stabilized),
+        "stabilized IPWs must be numeric"
+      ),
+      contract(
+        all(ipw.stabilized >= 0, na.rm = TRUE),
+        "stabilized IPWs must be non-negative"
+      )
+    )
+  )
+  #-----------------------------------  POST   --------------------------------#
+  
+  return(ipw.stabilized)
+}
+```
+
+\newpage
+# Plot Multiple IPWs Function
+```{r}
+plot_ipw <- function(ipws, titles, cols) {
+  
+  #-----------------------------------   PRE   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.list(ipws),
+        "ipws must be a list"
+      ),
+      contract(
+        length(ipws) > 0,
+        "ipws must be non-empty"
+      ),
+      contract(
+        all(vapply(ipws, is.numeric, logical(1))),
+        "all IPWs must be numeric"
+      ),
+      contract(
+        all(vapply(ipws, function(x) all(x >= 0, na.rm = TRUE), logical(1))),
+        "all IPWs must be non-negative"
+      ),
+      contract(
+        is.character(titles),
+        "titles must be a string vector"
+      ),
+      contract(
+        length(titles) >= length(ipws),
+        "titles must contain at least one title for each IPW"
+      ),
+      contract(
+        is.character(cols),
+        "cols must be a string vector"
+      ),
+      contract(
+        length(cols) >= length(ipws),
+        "cols must contain at least one color for each IPW"
+      )
+    )
+  )
+  #-----------------------------------   PRE   --------------------------------#
+  
+  cols.alpha <- adjustcolor(cols, alpha.f = 0.5)
+  par(mar = c(2, 2, 2, 0))
+  
+  # common breaks for all IPWs
+  breaks <- seq(
+    0,
+    max(unlist(ipws)) + 0.5,
+    by = 0.1
+  )
+  
+  # plot first ipw distribution
+  hist(
+    ipws[[1]],
+    col = cols.alpha[1],
+    breaks = breaks,
+    xlim = c(0, 5),
+    main = "IPW Comparison",
+    ylab = "Frequency",
+    xlab = "IPWs"
+  )
+  
+  # add remaining ipw distributions
+  if (length(ipws) > 1) {
+    for (i in 2:length(ipws)) {
+      hist(
+        ipws[[i]],
+        col = cols.alpha[i],
+        breaks = breaks,
+        add = TRUE
+      )
+    }
+  }
+  
+  box()
+  
+  legend(
+    "topright",
+    legend = titles,
+    fill = cols,
+    border = "black",
+    bty = "n"
+  )
+}
+```
+
+\newpage
+# Weighted Descriptive Statistics: Table Two Function
+```{r}
+weighted_table_one <- function(data.set, weights, covariates, outcome) {
+  
+  #-----------------------------------   PRE   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.data.frame(data.set),
+        "data.set must be a data.frame"
+      ),
+      contract(
+        is.numeric(weights),
+        "weights must be numeric"
+      ),
+      contract(
+        length(weights) == nrow(data.set),
+        "weights must have the same length as the number of rows in data.set"
+      ),
+      contract(
+        all(weights >= 0, na.rm = TRUE),
+        "weights must be non-negative"
+      ),
+      contract(
+        is.character(covariates) && length(covariates) > 0,
+        "covariates must be a non-empty string vector"
+      ),
+      contract(
+        all(covariates %in% names(data.set)),
+        "covariates must be columns of the data set"
+      ),
+      contract(
+        is.character(outcome) && length(outcome) == 1,
+        "outcome must be a single string"
+      ),
+      contract(
+        outcome %in% names(data.set),
+        "outcome must be a column of the data set"
+      )
+    )
+  )
+  #-----------------------------------   PRE   --------------------------------#
+  
+  # create weighted data set
+  data.set.ipw <- survey::svydesign(
+    ids = ~ 0,
     data = data.set,
-    family = binomial(link = "logit")
+    weights = weights
   )
-)
-
-## Separate estimated propensity scores by treatment group to assess the
-## degree of overlap in treatment assignment probabilities
-propensity.score.0 <- propensity.score[A == 0]
-propensity.score.1 <- propensity.score[A == 1]
-```
-
-# Propensity Score Overlap
-```{r}
-## Plot the propensity score distributions for treated and untreated patients
-## to visually assess the positivity/overlap condition
-par(
-  mar=c(2,2,2,0)
-)
-
-hist(
-  propensity.score.0,
-  col=col.control,
-  breaks=seq(0,1,by=0.02),
-  ylim=c(0,200),
-  main="Propensity Score Overlap",
-  xlab="Propensity Scores"
-)
-
-hist(
-  propensity.score.1,
-  col=col.exposed,
-  breaks=seq(0,1,by=0.02),
-  add=T
-)
-
-box()
-
-legend(
-  "topright",
-  legend=c('A = 0', 'A = 1'),
-  fill=c(col.control,col.exposed),
-  border="black",
-  bty="n"
-)
-```
-
-\newpage
-# Stabilized Inverse Probability Weights
-```{r}
-## Estimate the marginal probability of treatment, used to construct the
-## numerator of the stabilized treatment weights
-p.A1 <- mean(A)
-
-## Calculate unstabilized inverse probability of treatment weights (IPWs)
-## by taking the inverse of the estimated probability of the treatment
-## actually received
-ipw.unstabilized <- ifelse(
-  A == 1,
-  1 / propensity.score,
-  1 / (1 - propensity.score)
-)
-
-## Calculate stabilized IPWs by incorporating the marginal probability of
-## treatment in the numerator. Stabilization reduces the variability of the
-## weights while preserving their role in creating a weighted pseudo-population
-ipw.stabilized <- ifelse(
-  A == 1,
-  p.A1 / propensity.score,
-  (1 - p.A1) / (1 - propensity.score)
-)
-```
-
-# IPW Distribution
-```{r}
-## Compare the distributions of the unstabilized and stabilized IPWs to
-## assess the magnitude and variability of the resulting weights
-par(
-  mar=c(2,2,2,0)
-)
-
-hist(
-  ipw.unstabilized,
-  col=col.control,
-  breaks=seq(0, max(ipw.unstabilized) + 0.5,by=0.1),
-  ylim=c(0,1000),
-  xlim=c(0, 10),
-  main="Unstablized vs. Stabilized IPWs",
-  ylab="Frequency",
-  xlab="IPWs"
-)
-
-hist(
-  ipw.stabilized,
-  col=col.exposed,
-  breaks=seq(0, max(ipw.stabilized) + 0.5,by=0.1),
-  add=T
-)
-
-box()
-
-legend(
-  "topright",
-  legend=c('Unstabilized', 'Stabilized'),
-  fill=c(col.control,col.exposed),
-  border="black", bty="n"
-)
-```
-
-\newpage
-# Descriptive Statistics: Table One
-```{r}
-## Specify the baseline covariates to be included in the descriptive table
-covariates = c(
-  "Gender",
-  "Age",
-  "Weight",
-  "Race",
-  "Education",
-  "Income",
-  "InsuranceClass",
   
-  "CHFhx",
-  "CARDIOhx",
-  "DEMENThx",
-  "PSYCHhx",
-  "CHRPULhx",
-  "RENALhx",
-  "LIVERhx",
-  "GIBLEDhx",
-  "MALIGhx",
-  "IMMUNhx",
-  "TRANShx",
-  "AMIhx",
+  # create table one for the weighted data set
+  table.one.ipw <- tableone::svyCreateTableOne(
+    vars = covariates,
+    strata = outcome,
+    data = data.set.ipw,
+    test = FALSE
+  )
   
-  "Cancer",
-  "Category",
-  "Severity"
-)
-
-## Generate the unweighted baseline characteristics table, stratified by
-## treatment group. Statistical significance tests are omitted because the
-## primary objective is descriptive comparison of baseline characteristics.
-table.one.original <- CreateTableOne(
-  vars = covariates,
-  strata = "A",
-  data = data.set,
-  test = FALSE
-)
-
-## Display standardized mean differences (SMDs) to quantify baseline
-## differences between the treatment groups
-print(table.one.original, smd = TRUE)
+  print(table.one.ipw, smd = TRUE)
+}
 ```
 
 \newpage
-# Weighted Descriptive Statistics: Table Two
-```{r, warning=FALSE, message=FALSE}
-## Construct a survey design object using the stabilized IPWs. Setting ids = ~0
-## specifies that observations are treated as independent sampling units.
-data.set.ipw <- svydesign(
-  ids = ~ 0,
-  data = data.set,
-  weights = ipw.stabilized
-)
-
-## Generate the weighted baseline characteristics table using the IPW-defined
-## pseudo-population, stratified by treatment group
-table.one.ipw <- svyCreateTableOne(
-  vars = covariates,
-  strata = "A",
-  data = data.set.ipw,
-  test = FALSE
-)
-
-## Display standardized mean differences for the weighted covariate
-## distributions to assess residual imbalance after IPW
-print(table.one.ipw, smd = TRUE)
-```
-
-\newpage
-# Covariate Balance Before and After IPW
-```{r, warning=FALSE, message=FALSE}
-## Assess covariate balance before and after application of the stabilized
-## inverse probability weights. The unweighted and weighted SMDs are retained
-## to facilitate direct comparison of balance across treatment groups.
-balance <- bal.tab(
-  A ~ Gender +
-    Age +
-    Weight +
-    Race +
-    Education +
-    Income +
-    InsuranceClass +
-    CHFhx +
-    CARDIOhx +
-    DEMENThx +
-    PSYCHhx +
-    CHRPULhx +
-    RENALhx +
-    LIVERhx +
-    GIBLEDhx +
-    MALIGhx +
-    IMMUNhx +
-    TRANShx +
-    AMIhx + 
-    Cancer + 
-    Category + 
-    Severity,
-  data = data.set,
-  weights = ipw.stabilized,
-  method = "weighting",
-  estimand = "Average Treatment Effect",
-  un = TRUE
-)
-
-## Visualize the standardized mean differences before and after IPW.
-## An absolute SMD below 0.1 is used as the criterion for acceptable
-## covariate balance.
-love.plot(
-  balance,
-  stats = "mean.diffs",
-  threshold = 0.1,
-  abs = TRUE,
-  line = TRUE,
-  var.order = "unadjusted",
-  colors = c(col.control, col.exposed),
-  shapes = c(17, 16),
-  limits = c(m = c(0, 0.3)),
-  title = "Covariate Balance Before and After IPW",
-  labels = TRUE
-)
-
-## Covariate balance improved substantially following application of the
-## stabilized inverse probability weights, indicating improved comparability
-## between treatment groups in the weighted pseudo-population.
+# Plot Covariate Balance
+```{r}
+plot_cov_balance <- function(
+    data.set, covariates.added, outcome, weights.list, weights.titles, cols  
+  ) {
+  
+  #-----------------------------------   PRE   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.data.frame(data.set),
+        "data.set must be a data.frame"
+      ),
+      contract(
+        is.character(covariates.added) && length(covariates.added) == 1,
+        "covariates.added must be a single string"
+      ),
+      contract(
+        nzchar(covariates.added),
+        "covariates.added must be non-empty"
+      ),
+      contract(
+        is.list(weights.list) && length(weights.list) > 0,
+        "weights.list must be a non-empty list"
+      ),
+      contract(
+        all(vapply(weights.list, is.numeric, logical(1))),
+        "all elements of weights.list must be numeric"
+      ),
+      contract(all(vapply(
+        weights.list, function(x) length(x) == nrow(data.set), logical(1)
+      )),
+        "all weight vectors must have the same length as the data set"
+      ),
+      contract(all(vapply(
+        weights.list, function(x) all(x >= 0, na.rm = TRUE), logical(1))
+      ),
+        "all weights must be non-negative"
+      ),
+      contract(
+        is.character(weights.titles),
+        "weights.titles must be a string vector"
+      ),
+      contract(
+        length(weights.titles) >= length(weights.list),
+        "weights.titles must contain at least one title for each weight set"
+      ),
+      contract(
+        is.character(cols),
+        "cols must be a character vector"
+      ),
+      contract(
+        length(cols) >= length(weights.list) + 1,
+        "cols must contain at least one color for each weight set"
+      ),
+      contract(
+        is.character(outcome) && length(outcome) == 1,
+        "outcome must be a single string"
+      ),
+      contract(
+        outcome %in% names(data.set),
+        "outcome must be a column of the data set"
+      )
+    )
+  )
+  #-----------------------------------   PRE   --------------------------------#
+  
+  balance.types <- length(weights.list)
+  
+  # access covariate balance before and after weighting
+  balance <- cobalt::bal.tab(
+    as.formula(paste0(outcome, " ~ ", covariates.added)),
+    data = data.set,
+    weights = weights.list,
+    method = "weighting",
+    estimand = "ATE",
+    un = TRUE
+  )
+  
+  # plot the covariate balance
+  cobalt::love.plot(
+    balance,
+    stats = "mean.diffs",
+    threshold = 0.1,
+    abs = TRUE,
+    line = TRUE,
+    var.order = "unadjusted",
+    sample.names = c("Unadjusted", weights.titles),
+    colors = cols[seq(1, 1+balance.types, 1)],
+    shapes = seq(17, 17-balance.types, -1),
+    limits = c(m = c(0, 0.3)),
+    title = "Covariate Balance Before and After Weighting",
+    labels = TRUE
+  )
+}
 ```
 
 \newpage
 # Estimation
-
-## Assumptions
-*Non-Informative Censoring*
 
 # Modified Case-Base Smooth Hazard Model
 ```{r}
@@ -489,42 +825,96 @@ FSH <- function(
     formula,
     data,
     time,
-    w = rep(1, nrow(data)),
-    ratio = 100, ...  
+    weights = rep(1, nrow(data)),
+    ratio = 100,
+    ...
 ) {
   
-  ## Preserve the original function call for reproducibility and method
-  ## dispatch in downstream model summaries
-  cl <- match.call()
-  
-  ## Explicitly expand "." in the model formula so that all covariates in the
-  ## supplied dataset are represented in the model specification
-  formula <- expand.dot.formula(
-    formula,
-    data = data
-  )
-  
-  ## Extract the event variable from the left-hand side of the model formula
-  eventVar <- all.vars(formula[[2]])
-  
-  ## If the follow-up time variable is not explicitly supplied, infer it from
-  ## the data using the event variable and the standard case-base structure
-  if (missing(time)) {
-    varNames <- checkArgsTimeEvent(
-      data = data,
-      event = eventVar
+  #-----------------------------------   PRE   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        inherits(try(formula(formula), silent = TRUE), "formula"),
+        "formula must be a valid formula"
+      ),
+      contract(
+        length(all.vars(formula[[2]])) == 1,
+        "formula must contain exactly one event variable"
+      ),
+      contract(
+        is.data.frame(data) || inherits(data, "singleEventCB"),
+        "data must be a data.frame or a singleEventCB object"
+      ),
+      contract(
+        is.numeric(weights),
+        "weights must be numeric"
+      ),
+      contract(
+        length(weights) == nrow(data),
+        "weights must have the same length as the number of rows in data"
+      ),
+      contract(
+        all(!is.na(weights)),
+        "weights must not contain missing values"
+      )
     )
+  )
+  #-----------------------------------   PRE   --------------------------------#
+  
+  # preserve the original function call for reproducibility
+  orig.call <- match.call()
+  
+  ## Expand "." in a model formula into the complete set of covariates available
+  ## in the supplied dataset. This ensures that the modified FSH function can
+  ## explicitly evaluate formulas containing "." before fitting the model.
+  expand.dot.formula <- function(formula, data = NULL) {
     
-    timeVar <- varNames$time
+    ## Check whether the formula contains the "." shorthand for all available
+    ## predictors
+    if (isTRUE("." %in% all.vars(formula))) {
+      
+      ## Preserve the original formula attributes while expanding the terms
+      formula.attrs <- attributes(formula)
+      
+      try.terms <- try(
+        terms(formula, data = data),
+        silent = TRUE
+      )
+      
+      ## Replace the shorthand formula with its explicitly expanded version when
+      ## the terms object can be constructed successfully
+      if (!is(try.terms, "try-error")) {
+        formula <- formula(try.terms)
+      }
+      
+      ## Restore the original formula attributes after expansion
+      attributes(formula) <- formula.attrs
+    }
+    
+    ## Return the expanded formula
+    return(formula)
+  }
+  
+  formula <- expand.dot.formula(formula, data = data)
+  
+  # extract the event variable from the left-hand side of the model formula
+  event.var <- all.vars(formula[[2]])
+  
+  #extract time variable from the data set
+  if (missing(time)) {
+    var.names <- casebase::checkArgsTimeEvent(
+      data = data,
+      event = event.var
+    )
+    time.var <- var.names$time
     
   } else {
-    ## Otherwise, use the time variable explicitly supplied by the user
-    timeVar <- time
+    time.var <- time
   }
   
   ## Identify the distinct event types present in the data to determine whether
   ## the analysis involves a single event or competing risks
-  typeEvents <- sort(unique(data[[eventVar]]))
+  type.events <- sort(unique(data[[event.var]]))
   
   
   # Case-Base Sampling
@@ -534,24 +924,24 @@ FSH <- function(
   ## weights can be incorporated into the case-base sampling procedure.
   if (!inherits(data, "cbData")) {
     
-    originalData <- as.data.frame(data)
-    originalData$w <- w
+    original.data <- as.data.frame(data)
+    original.data$weights <- weights
     
     ## Sample cases and controls from the person-time data. The sampling ratio
     ## controls the number of person-moments sampled relative to observed cases.
-    sampleData <- sampleCaseBase(
-      originalData,
-      timeVar,
-      eventVar,
-      comprisk = (length(typeEvents) > 2),
+    sample.data <- casebase::sampleCaseBase(
+      original.data,
+      time.var,
+      event.var,
+      comprisk = (length(type.events) > 2),
       ratio
     )
     
   } else {
     ## If the input is already a case-base dataset, retain it directly.
     ## The original unsampled data are unavailable at this stage.
-    originalData <- data.frame()
-    sampleData <- data
+    original.data <- data.frame()
+    sample.data <- data
   }
   
   
@@ -564,15 +954,15 @@ FSH <- function(
   ## Fit a weighted binomial regression model to the case-base sample.
   ## Observation-level weights allow the model to incorporate IPWs in addition
   ## to the case-base sampling structure.
-  fittingFunction <- function(formula) glm(
+  fitting.function <- function(formula) glm(
     formula,
-    data = sampleData,
+    data = sample.data,
     family = binomial,
-    weights = w
+    weights = weights
   )
   
   ## Estimate the smooth hazard model using the weighted case-base sample
-  out <- fittingFunction(formula)
+  out <- fitting.function(formula)
   
   
   # Model Object and Metadata
@@ -580,20 +970,20 @@ FSH <- function(
   ## Preserve the lower-level glm call while replacing the displayed call with
   ## the original FSH call for consistency with the custom model interface
   out$lower_call <- out$call 
-  out$call <- cl
+  out$call <- orig.call
   
   ## Store the original data and key variable names for downstream methods
   ## such as prediction and plotting
-  out$originalData <- originalData
-  out$typeEvents <- typeEvents
-  out$timeVar <- timeVar
-  out$eventVar <- eventVar
+  out$originalData <- original.data
+  out$typeEvents <- type.events
+  out$timeVar <- time.var
+  out$eventVar <- event.var
   
   ## Record the number of case and background person-moments in the sampled
   ## case-base dataset
-  num_pm <- table(sampleData[[eventVar]])
-  out$num_cm <- num_pm[2]
-  out$num_bm <- num_pm[1]
+  num.person.moments <- table(sample.data[[event.var]])
+  out$num_cm <- num.person.moments[2]
+  out$num_bm <- num.person.moments[1]
   out$formula <- formula
   
   ## Store the case-base sampling offset separately, then reset the model's
@@ -606,459 +996,265 @@ FSH <- function(
   ## models can be applied to the fitted object
   class(out) <- c("singleEventCB", class(out))
   
+  #-----------------------------------  POST   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        inherits(out, "singleEventCB"),
+        "result must inherit from singleEventCB"
+      ),
+      contract(
+        is.data.frame(out$originalData),
+        "originalData must be a data.frame"
+      ),
+      contract(
+        is.double(out$typeEvents),
+        "typeEvents must be a double vector"
+      ),
+      contract(
+        is.character(out$timeVar) && length(out$timeVar) == 1,
+        "timeVar must be a single character string"
+      ),
+      contract(
+        out$timeVar %in% names(out$originalData),
+        "timeVar must be a column of out$originalData"
+      ),
+      contract(
+        is.character(out$eventVar) && length(out$eventVar) == 1,
+        "eventVar must be a single character string"
+      ),
+      contract(
+        out$eventVar %in% names(out$originalData),
+        "eventVar must be a column of out$originalData"
+      ),
+      contract(
+        out$eventVar == event.var,
+        "eventVar must equal the event variable from the input formula"
+      ),
+      contract(
+        is.integer(out$num_cm) && length(out$num_cm) == 1,
+        "num_cm must be one integer"
+      ),
+      contract(
+        is.integer(out$num_bm) && length(out$num_bm) == 1,
+        "num_bm must be one integer"
+      ),
+      contract(
+        out$num_bm > out$num_cm,
+        "num_bm must be greater than out$num_cm"
+      ),
+      contract(
+        inherits(out$formula, "formula"),
+        "formula must be a valid formula"
+      ),
+      contract(
+        is.double(out$offset),
+        "offset must be a double vector"
+      ),
+      contract(
+        length(out$offset) == nrow(out$data),
+        "offset must have the same length as the number of rows in out$data"
+      ),
+      contract(
+        is.data.frame(out$data),
+        "data must be a data.frame"
+      ),
+      contract(
+        nrow(out$data) > 0,
+        "data must have at least one row"
+      ),
+      contract(
+        all(c(out$eventVar, out$timeVar) %in% names(out$data)),
+        "data must contain the event and time variables"
+      ),
+      contract(
+        is.language(out$lower_call),
+        "lower_call must be a language object"
+      ),
+      contract(
+        is.language(out$call),
+        "call must be a language object"
+      )
+    )
+  )
+  #-----------------------------------  POST   --------------------------------#
+  
   return(out)
 }
 ```
 
-# Formula Expansion Helper
+\newpage
+# Extract and Report Hazard Ratio
 ```{r}
-## Expand "." in a model formula into the complete set of covariates available
-## in the supplied dataset. This ensures that the modified FSH function can
-## explicitly evaluate formulas containing "." before fitting the model.
-expand.dot.formula <- function(formula, data = NULL) {
+## Extract the treatment coefficient, calculate its standard error, and report
+## the hazard ratio with its corresponding 95% Wald confidence interval.
+extract_print_hr <- function(model, se.func) {
   
-  ## Check whether the formula contains the "." shorthand for all available
-  ## predictors
-  if (isTRUE("." %in% all.vars(formula))) {
-    
-    ## Preserve the original formula attributes while expanding the terms
-    att <- attributes(formula)
-    
-    try.terms <- try(
-      stats::terms(formula, data = data),
-      silent = TRUE
+  #-----------------------------------   PRE   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.function(se.func),
+        "se.func must be a function"
+      ),
+      contract(
+        "A" %in% names(coef(model)),
+        "model must contain a coefficient named A"
+      ),
+      contract(
+        "A" %in% rownames(se.func(model)),
+        "se.func(model) must contain a standard error for A"
+      )
     )
-    
-    ## Replace the shorthand formula with its explicitly expanded version when
-    ## the terms object can be constructed successfully
-    if (!is(try.terms, "try-error")) {
-      formula <- formula(try.terms)
-    }
-    
-    ## Restore the original formula attributes after expansion
-    attributes(formula) <- att
-  }
+  )
+  #-----------------------------------   PRE   --------------------------------#
   
-  ## Return the expanded formula
-  return(formula)
+  # Extract the treatment coefficient and its standard error
+  beta <- coef(model)["A"]
+  se <- sqrt(diag(se.func(model))["A"])
+  
+  # Transform the treatment coefficient from the log-hazard ratio scale to the
+  # hazard ratio scale and calculate the corresponding 95% Wald confidence
+  # interval
+  cat("HR-hat:", exp(beta), "\n")
+  cat("SE of HR-hat:", se, "\n")
+  cat(
+    "95% CI: (",
+    exp(beta + c(-1, 1) * 1.96 * se),
+    ")\n"
+  )
 }
 ```
 
 \newpage
-# Case-Base Model Setup
+# Fit Model
 ```{r}
-## Set the case-base sampling ratio used across all case-base model fits.
-## A ratio of 100 samples 100 background person-moments per observed case.
-fsh.ratio <- 100
+fit_model <- function(
+    fitting.function,
+    formula,
+    data.set,
+    seed,
+    extract.print.hr,
+    constant.HR = TRUE,
+    se.func = NULL,
+    ...  
+  ) {
+  
+  #-----------------------------------   PRE   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.function(fitting.function),
+        "fitting.function must be a function"
+      ),
+      contract(
+        inherits(try(formula(formula), silent = TRUE), "formula"),
+        "formula must be a valid formula"
+      ),
+      contract(
+        is.data.frame(data.set),
+        "data.set must be a data.frame"
+      ),
+      contract(
+        is.numeric(seed) && length(seed) == 1,
+        "seed must be a single numeric value"
+      ),
+      contract(
+        is.function(extract.print.hr),
+        "extract.print.hr must be a function"
+      ),
+      contract(
+        is.logical(constant.HR) && length(constant.HR) == 1,
+        "constant.HR must be a single logical value"
+      ),
+      contract(
+        is.function(se.func) || is.null(se.func),
+        "se.func must be a function or NULL"
+      ),
+      contract(
+        !constant.HR || is.function(se.func),
+        "se.func must be a function when constant.HR is TRUE"
+      )
+    )
+  )
+  #-----------------------------------   PRE   --------------------------------#
+  
+  ## Set seed to ensure reproducibility of any stochastic procedures used
+  ## during model fitting
+  set.seed(seed)
+  
+  ## Evaluate arguments supplied through ...
+  dots <- list(...)
+  
+  ## Fit Model
+  model <- do.call(
+    fitting.function,
+    c(
+      list(
+        formula = formula,
+        data = data.set
+      ),
+      dots
+    )
+  )
+  
+  if (constant.HR) {
+    ## Extract and report the hazard ratio
+    extract.print.hr(model, se.func) 
+  }
+  
+  result <- model
+  
+  #-----------------------------------  POST   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        !is.null(result),
+        "fit_model must return a non-NULL fitted model"
+      )
+    )
+  )
+  #-----------------------------------  POST   --------------------------------#
+  
+  return(result)
+}
 ```
 
-# Counterfactual Survival Curve Setup
+\newpage
+# Case Base Variable HR Extraction
 ```{r}
-## Define the two treatment levels used to generate counterfactual survival
-## curves: A = 0 represents no RHC and A = 1 represents RHC
-trt.types <- c(0, 1)
-
-## Create a single-treatment profile for prediction under the treated condition
-individual.profile.data <- data.frame(A = 1)
-
-## Create a prediction dataset containing both treatment levels for estimation
-## of counterfactual survival under each treatment condition
-survival.curves.data <- data.frame(A = trt.types)
-
-# Time Grid Definition
-
-## Determine the maximum observed follow-up time in the analysis dataset
-tau.max <- max(data.set$time, na.rm = TRUE)
-
-## Restrict the primary survival-curve display to the first 150 days
-## (approximately four months) to focus on the relevant follow-up period
-t.max <- 150
-
-## Define the time grid used for RMST integration, spanning the full observed
-## follow-up period at one-day intervals
-tau.grid <- seq(0, tau.max, by = 1)
-
-## Define the time grid used for plotting and estimating survival curves over
-## a restricted four-month follow-up period
-t.grid <- seq(0, t.max, by = 1)
-```
-
-\newpage
-# Model 1: Unadjusted Marginal Structural Cox Model
-```{r, cache=TRUE}
-## Set seed to ensure reproducibility of any stochastic procedures used
-## during model fitting
-set.seed(s)
-
-## Fit an unadjusted Cox proportional hazards model with treatment as the
-## sole predictor. The resulting coefficient estimates the marginal
-## log-hazard ratio comparing RHC with no RHC.
-model.1 <- coxph(
-  Surv(time, Delta) ~ A,
-  data = data.set,
-  robust = TRUE
-)
-
-## Extract the treatment coefficient and its standard error
-beta.1 <- coef(model.1)["A"]
-se.1 <- sqrt(diag(vcov(model.1))["A"])
-
-## Transform the treatment coefficient from the log-hazard ratio scale to the
-## hazard ratio scale and calculate the corresponding 95% Wald confidence
-## interval
-cat("HR-hat:", exp(beta.1), "\n")
-cat("SE of HR-hat:", se.1, "\n")
-cat("95% CI: (", exp(beta.1 + c(-1,1)*1.96*se.1), ")\n")
-```
-
-# Model 2: Unadjusted Case-Base Model
-```{r, cache=TRUE, warning=FALSE, message=FALSE}
-## Set seed to ensure reproducibility of the case-base sampling procedure
-set.seed(s)
-
-## Fit an unadjusted smooth hazard model using case-base sampling, with
-## treatment as the sole predictor. The sampling ratio determines the number
-## of background person-moments sampled for each observed case.
-model.2 <- fitSmoothHazard(
-  Delta ~ A,
-  data = data.set,
-  ratio = fsh.ratio
-)
-
-## Extract the treatment coefficient and calculate its robust standard error
-## using the heteroskedasticity-consistent covariance estimator
-beta.2 <- coef(model.2)["A"]
-se.2 <- sqrt(diag(vcovHC(model.2))["A"])
-
-## Transform the treatment coefficient to the hazard ratio scale and calculate
-## the corresponding 95% Wald confidence interval
-cat("HR-hat:", exp(beta.2), "\n")
-cat("SE of HR-hat:", se.2, "\n")
-cat("95% CI: (", exp(beta.2 + c(-1,1)*1.96*se.2), ")\n")
-```
-
-\newpage
-# Model 3: Covariate-Adjusted Cox Model
-```{r, cache=TRUE}
-## Set seed to ensure reproducibility of any stochastic procedures used
-## during model fitting
-set.seed(s)
-
-## Fit a covariate-adjusted Cox proportional hazards model. Treatment is
-## adjusted for the full set of observed baseline demographic, socioeconomic,
-## comorbidity, and disease-severity covariates.
-model.3 <- coxph(
-  Surv(time, Delta) ~ A +
-    Gender +
-    Age +
-    Weight +
-    Race +
-    Education +
-    Income +
-    InsuranceClass +
-    CHFhx +
-    CARDIOhx +
-    DEMENThx +
-    PSYCHhx +
-    CHRPULhx +
-    RENALhx +
-    LIVERhx +
-    GIBLEDhx +
-    MALIGhx +
-    IMMUNhx +
-    TRANShx +
-    AMIhx + 
-    Cancer + 
-    Category + 
-    Severity,
-  data = data.set,
-  robust = TRUE
-)
-
-## Extract the treatment coefficient and its robust standard error
-beta.3 <- coef(model.3)["A"]
-se.3 <- sqrt(diag(vcov(model.3))["A"])
-
-## Transform the treatment coefficient to the hazard ratio scale and calculate
-## the corresponding 95% Wald confidence interval
-cat("HR-hat:", exp(beta.3), "\n")
-cat("SE of HR-hat:", se.3, "\n")
-cat("95% CI: (", exp(beta.3 + c(-1,1)*1.96*se.3), ")\n")
-```
-
-\newpage
-# Model 4: Covariate-Adjusted Case-Base Model
-```{r, cache=TRUE, warning=FALSE, message=FALSE}
-## Set seed to ensure reproducibility of the case-base sampling procedure
-set.seed(s)
-
-## Fit a covariate-adjusted smooth hazard model using case-base sampling.
-## The model uses the same treatment and baseline covariates as the adjusted
-## Cox model to provide a directly comparable alternative estimator.
-model.4 <- fitSmoothHazard(
-  Delta ~ A +
-    Gender +
-    Age +
-    Weight +
-    Race +
-    Education +
-    Income +
-    InsuranceClass +
-    CHFhx +
-    CARDIOhx +
-    DEMENThx +
-    PSYCHhx +
-    CHRPULhx +
-    RENALhx +
-    LIVERhx +
-    GIBLEDhx +
-    MALIGhx +
-    IMMUNhx +
-    TRANShx +
-    AMIhx + 
-    Cancer + 
-    Category + 
-    Severity,
-  data = data.set,
-  ratio = fsh.ratio
-)
-
-## Extract the treatment coefficient and calculate its heteroskedasticity-
-## consistent standard error
-beta.4 <- coef(model.4)["A"]
-se.4 <- sqrt(diag(vcovHC(model.4))["A"])
-
-## Transform the treatment coefficient to the hazard ratio scale and calculate
-## the corresponding 95% Wald confidence interval
-cat("HR-hat:", exp(beta.4), "\n")
-cat("SE of HR-hat:", se.4, "\n")
-cat("95% CI: (", exp(beta.4 + c(-1,1)*1.96*se.4), ")\n")
-```
-
-\newpage
-# Model 5: Marginal Structural Cox Model
-```{r, cache=TRUE}
-## Set seed to ensure reproducibility of any stochastic procedures used
-## during model fitting
-set.seed(s)
-
-## Fit the marginal structural Cox model using stabilized inverse probability
-## weights (IPWs). The treatment-only model estimates the marginal treatment
-## effect in the IPW-defined pseudo-population.
-model.5 <- coxph(
-  Surv(time, Delta) ~ A,
-  data = data.set,
-  weights = ipw.stabilized,
-  robust = TRUE
-)
-
-## Extract the treatment coefficient and its robust standard error
-beta.5 <- coef(model.5)["A"]
-se.5 <- sqrt(diag(vcov(model.5))["A"])
-
-## Transform the treatment coefficient to the hazard ratio scale and calculate
-## the corresponding 95% Wald confidence interval
-cat("HR-hat:", exp(beta.5), "\n")
-cat("SE of HR-hat:", se.5, "\n")
-cat("95% CI: (", exp(beta.5 + c(-1,1)*1.96*se.5), ")\n")
-```
-
-\newpage
-# Model 6: IPW Case-Base Proportional Hazards Model
-```{r, cache=TRUE, warning=FALSE, message=FALSE}
-## Set seed to ensure reproducibility of the case-base sampling procedure
-set.seed(s)
-
-## Fit the modified smooth hazard model using case-base sampling and stabilized
-## IPWs. The custom FSH function incorporates the IPWs as observation-level
-## weights while accounting for the case-base sampling mechanism.
-model.6 <- FSH(
-  Delta ~ A,
-  data = data.set,
-  ratio = fsh.ratio,
-  w = ipw.stabilized
-)
-
-## Extract the treatment coefficient and calculate its heteroskedasticity-
-## consistent standard error
-beta.6 <- coef(model.6)["A"]
-se.6 <- sqrt(diag(vcovHC(model.6))["A"])
-
-## Transform the treatment coefficient to the hazard ratio scale and calculate
-## the corresponding 95% Wald confidence interval
-cat("HR-hat:", exp(beta.6), "\n")
-cat("SE of HR-hat:", se.6, "\n")
-cat("95% CI: (", exp(beta.6 + c(-1,1)*1.96*se.6), ")\n")
-```
-
-\newpage
-# Survival Curve Prediction Setup
-```{r, cache=TRUE}
-## Define the two treatment levels used to generate counterfactual survival
-## curves under no RHC (A = 0) and RHC (A = 1)
-trt.types <- c(0, 1)
-
-## Define the treatment profile used for individual-level prediction
-individual.profile.data <- data.frame(A = 1)
-
-## Create a prediction dataset containing both treatment levels for estimation
-## of the corresponding counterfactual survival curves
-survival.curves.data <- data.frame(A = trt.types)
-
-## Determine the maximum observed follow-up time and define the restricted
-## four-month follow-up period used for focused visualization
-tau.max <- max(data.set$time, na.rm = TRUE)
-t.max <- 150
-
-## Define the full follow-up grid and the restricted four-month grid
-tau.grid <- seq(0, tau.max, by = 1)
-t.grid <- seq(0, t.max, by = 1)
-```
-
-\newpage
-# Model 7: Unadjusted Case-Base Model with Time-Varying Hazard Ratio
-```{r, cache=TRUE, warning=FALSE, message=FALSE}
-## Set seed to ensure reproducibility of the case-base sampling procedure
-set.seed(s)
-
-## Fit an unadjusted case-base smooth hazard model allowing the treatment
-## effect to vary over time. The spline term models the baseline time effect,
-## while its interaction with treatment permits a non-constant hazard ratio.
-model.7 <- FSH(
-  Delta ~ pspline(time, df = 2) * A,
-  data = data.set,
-  ratio = fsh.ratio
-)
-```
-
-# Time-Varying Hazard Ratio: Full Follow-Up
-```{r, message=FALSE}
-## Display the estimated treatment hazard ratio as a function of follow-up
-## time, including its 95% confidence interval
-plot(
-  model.7,
-  type = "hr",
-  newdata = expand.grid(
-    time = tau.grid,
-    A = trt.types
-  ),
-  var = "A",
-  xvar = "time",
-  ci = TRUE,
-  ylim = c(0,2),
-  xlab="Time",
-  ylab="Hazard Ratio",
-  main="Model 7: Variable Hazard Ratio"
-)
-
-## Add a reference line corresponding to a hazard ratio of 1, representing
-## no instantaneous treatment effect
-abline(h = 1, col = "red", lty = 2)
-```
-
-# Time-Varying Hazard Ratio: First Four Months
-```{r}
-## Restrict the hazard-ratio plot to the first 150 days (approximately four
-## months) to provide a more detailed view of the early follow-up period
-plot(
-  model.7,
-  type = "hr",
-  newdata = expand.grid(
-    time = t.grid,
-    A = trt.types
-  ),
-  var = "A",
-  xvar = "time",
-  ci = TRUE,
-  ylim = c(1,1.5),
-  xlab="Time",
-  ylab="Hazard Ratio",
-  main="Model 7: Variable Hazard Ratio - First 4 Months"
-)
-
-## Add the no-effect reference line
-abline(h = 1, col = "red", lty = 2)
-```
-
-\newpage
-# Model 8: IPW Case-Base Model with Time-Varying Hazard Ratio
-```{r, cache=TRUE, warning=FALSE, message=FALSE}
-## Set seed to ensure reproducibility of the case-base sampling procedure
-set.seed(s)
-
-## Fit the IPW case-base smooth hazard model, allowing the treatment effect
-## to vary over time. Stabilized IPWs are incorporated through the modified
-## FSH function to estimate the treatment effect in the weighted
-## pseudo-population.
-model.8 <- FSH(
-  Delta ~ pspline(time, df = 2) * A,
-  data = data.set,
-  ratio = fsh.ratio,
-  w = ipw.stabilized
-)
-```
-
-# Time-Varying Hazard Ratio: Full Follow-Up
-```{r, message=FALSE}
-## Display the estimated time-varying treatment hazard ratio and its 95%
-## confidence interval over the full follow-up period
-plot(
-  model.8,
-  type = "hr",
-  newdata = expand.grid(
-    time = tau.grid,
-    A = trt.types
-  ),
-  var = "A",
-  xvar = "time",
-  ci = TRUE,
-  ylim = c(0,2),
-  xlab="Time",
-  ylab="Hazard Ratio",
-  main="Model 8: Variable Hazard Ratio"
-)
-
-## Add the no-effect reference line
-abline(h = 1, col = "red", lty = 2)
-```
-
-# Time-Varying Hazard Ratio: First Four Months
-```{r}
-## Restrict the hazard-ratio plot to the first 150 days to provide a more
-## detailed visualization of the early treatment effect
-plot(
-  model.8,
-  type = "hr",
-  newdata = expand.grid(
-    time = t.grid,
-    A = trt.types
-  ),
-  var = "A",
-  xvar = "time",
-  ci = TRUE,
-  ylim = c(1,1.5),
-  xlab="Time",
-  ylab="Hazard Ratio",
-  main="Model 8: Variable Hazard Ratio - First 4 Months"
-)
-
-## Add the no-effect reference line
-abline(h = 1, col = "red", lty = 2)
-```
-
-# Head-to-Head Comparison: Models 7 and 8
-```{r}
-## Extract the estimated time-varying treatment hazard ratios and their 95%
-## confidence intervals from the unadjusted and IPW-adjusted case-base models.
-## The resulting estimates are used to construct a common comparison plot.
-get.hr <- function(model) {
+casebase_var_hr <- function(model, time.grid) {
+  
+  #-----------------------------------   PRE   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        !is.null(model),
+        "model must be a valid fitted model object"
+      ),
+      contract(
+        is.numeric(time.grid),
+        "time.grid must be numeric"
+      ),
+      contract(
+        length(time.grid) > 0,
+        "time.grid must contain at least one point"
+      ),
+      contract(
+        all(diff(time.grid) > 0),
+        "time.grid must be strictly increasing"
+      )
+    )
+  )
+  #-----------------------------------   PRE   --------------------------------#
+  
   invisible(pdf(NULL))
   
   out <- plot(
     model,
     type = "hr",
     newdata = data.frame(
-      time = tau.grid,
+      time = time.grid,
       A = 0
     ),
     var = "A",
@@ -1068,84 +1264,153 @@ get.hr <- function(model) {
   
   invisible(dev.off())
   
-  out
+  #-----------------------------------  POST   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        !is.null(out),
+        "casebase_var_hr must return a non-NULL result"
+      )
+    )
+  )
+  #-----------------------------------  POST   --------------------------------#
+  
+  return(out)
 }
+```
 
-## Extract the time-varying hazard-ratio estimates from Models 7 and 8
-hr.7 <- get.hr(model.7)
-hr.8 <- get.hr(model.8)
-
-# Combined Hazard-Ratio Plot
-
-## Initialize an empty plotting region using the time and hazard-ratio ranges
-## from the extracted estimates. The curves and confidence intervals for both
-## models are added to this common plotting region below.
-plot(
-  hr.7$time,
-  hr.7$hazard_ratio,
-  type = "n",
-  ylim = c(0, 2),
-  xlab = "Time",
-  ylab = "Hazard Ratio",
-  main = "Head-to-head Comparison of Variable HR Models"
-)
-
-# 95% Confidence Intervals
-
-## Add the 95% confidence interval band for the unadjusted case-base model
-polygon(
-  c(hr.7$time, rev(hr.7$time)),
-  c(hr.7$lowerbound, rev(hr.7$upperbound)),
-  col = adjustcolor("red", alpha.f = 0.20),
-  border = NA
-)
-
-## Add the 95% confidence interval band for the IPW-adjusted case-base model
-polygon(
-  c(hr.8$time, rev(hr.8$time)),
-  c(hr.8$lowerbound, rev(hr.8$upperbound)),
-  col = adjustcolor("blue", alpha.f = 0.20),
-  border = NA
-)
-
-# Estimated Hazard-Ratio Curves
-
-## Overlay the estimated time-varying hazard-ratio curve from the unadjusted
-## case-base model
-lines(
-  hr.7$time,
-  hr.7$hazard_ratio,
-  col = "red",
-  lwd = 2
-)
-
-## Overlay the estimated time-varying hazard-ratio curve from the IPW-adjusted
-## case-base model
-lines(
-  hr.8$time,
-  hr.8$hazard_ratio,
-  col = "blue",
-  lwd = 2
-)
-
-# Reference Line and Legend
-
-## Add a horizontal reference line at HR = 1, corresponding to no difference
-## in the instantaneous hazard between treatment groups
-abline(
-  h = 1,
-  col = "black",
-  lty = 2
-)
-
-## Identify the two estimation approaches shown in the combined plot
-legend(
-  "bottomleft",
-  legend = c("Unadjusted", "IPW-Adjusted"),
-  col = c("red", "blue"),
-  lwd = 2,
-  bty = "n"
-)
+\newpage
+# Plot time-dependent Hazard Ratios
+```{r}
+plot_time_dep_hr <- function(
+    models.list, main.title, time.grid, 
+    casebase.var.hr,
+    titles = "", cols = "red" 
+  ) {
+  
+  #-----------------------------------   PRE   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.list(models.list),
+        "models.list must be a list"
+      ),
+      contract(
+        length(models.list) > 0,
+        "models.list must be non-empty"
+      ),
+      contract(
+        is.character(main.title) && length(main.title) == 1,
+        "main.title must be a single string"
+      ),
+      contract(
+        is.numeric(time.grid),
+        "time.grid must be numeric"
+      ),
+      contract(
+        length(time.grid) > 0,
+        "time.grid must contain at least one point"
+      ),
+      contract(
+        all(diff(time.grid) > 0),
+        "time.grid must be strictly increasing"
+      ),
+      contract(
+        is.function(casebase.var.hr),
+        "casebase.var.hr must be a function"
+      ),
+      contract(
+        is.character(titles),
+        "titles must be a character vector"
+      ),
+      contract(
+        length(titles) >= length(models.list),
+        "titles must contain at least one title for each model"
+      ),
+      contract(
+        is.character(cols),
+        "cols must be a character vector"
+      ),
+      contract(
+        length(cols) >= length(models.list),
+        "cols must contain at least one color for each model"
+      )
+    )
+  )
+  #-----------------------------------   PRE   --------------------------------#
+  
+  # global function consts
+  hr.list <- list()
+  cols.alpha <- adjustcolor(cols, alpha.f = 0.2)
+  
+  # extract all hr curves
+  for (i in 1:length(models.list)) {
+    hr.list[[i]] <- casebase.var.hr(
+      model = models.list[[i]],
+      time.grid = time.grid
+    )
+  }
+  
+  # common time grid
+  common.time <- time.grid
+  
+  # common HR grid
+  common.hr <- range(
+    unlist(lapply(hr.list, function(x) x$hazard_ratio)),
+    na.rm = TRUE
+  )
+  
+  # define common time and hr grids here then use in plot below
+  
+  # define base plot
+  plot(
+    NA,
+    xlim = range(common.time),
+    ylim = range(common.hr),
+    type = "n",
+    xlab = "Time",
+    ylab = "Hazard Ratio",
+    main = main.title
+  )
+  
+  # plot all ci bands
+  for (i in 1:length(hr.list)) {
+    polygon(
+      c(hr.list[[i]]$time, rev(hr.list[[i]]$time)),
+      c(hr.list[[i]]$lowerbound, rev(hr.list[[i]]$upperbound)),
+      col = cols.alpha[i],
+      border = NA
+    )
+  }
+  
+  # plot all hr curves on top
+  for (i in 1:length(hr.list)) {
+    lines(
+      hr.list[[i]]$time,
+      hr.list[[i]]$hazard_ratio,
+      col = cols[i],
+      lwd = 2
+    )
+  }
+  
+  # plot null hr reference line
+  abline(
+    h = 1,
+    col = "black",
+    lty = 2
+  )
+  
+  if (length(models.list) > 1) {
+    # create legend
+    legend(
+      "bottomleft",
+      legend = titles,
+      col = cols,
+      lwd = 2,
+      bty = "n"
+    ) 
+  }
+}
 ```
 
 \newpage
@@ -1154,74 +1419,359 @@ legend(
 ## Numerically integrate a survival curve over the specified follow-up period
 ## using the trapezoidal rule. The cumulative integral at each time point
 ## represents the RMST up to that point.
-rmst.fn <- function(time, surv) {
-  dt <- diff(time)
-  mids <- (head(surv, -1) + tail(surv, -1)) / 2
-  c(0, cumsum(mids * dt))
+rmst_calculation <- function(time, surv) {
+  
+  #-----------------------------------   PRE   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.numeric(time),
+        "time must be numeric"
+      ),
+      contract(
+        length(time) > 0,
+        "time must contain at least one point"
+      ),
+      contract(
+        all(diff(time) > 0),
+        "time must be strictly increasing"
+      ),
+      contract(
+        is.numeric(surv),
+        "surv must be numeric"
+      ),
+      contract(
+        length(surv) == length(time),
+        "surv must have the same length as time"
+      ),
+      contract(
+        all(surv >= 0 & surv <= 1, na.rm = TRUE),
+        "surv must contain values between 0 and 1"
+      )
+    )
+  )
+  #-----------------------------------   PRE   --------------------------------#
+  
+  time.diff <- diff(time)
+  midpoints <- (head(surv, -1) + tail(surv, -1)) / 2
+  result <- c(0, cumsum(midpoints * time.diff))
+  
+  #-----------------------------------  POST   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.numeric(result),
+        "RMST calculation must return a numeric vector"
+      ),
+      contract(
+        length(result) == length(time),
+        "RMST calculation result must have the same length as time"
+      ),
+      contract(
+        result[1] == 0,
+        "RMST calculation result must start at 0"
+      )
+    )
+  )
+  #-----------------------------------  POST   --------------------------------#
+  
+  return(result)
 }
 ```
 
 \newpage
 # MS-Cox RMST and Standard Error
 ```{r}
-## Calculate the counterfactual RMST contrast and its standard error from the
+## Calculate the Counter-factual RMST contrast and its standard error from the
 ## marginal structural Cox model. The RMST contrast is defined as the
 ## difference in restricted mean survival between RHC and no RHC.
-cox.rmst.list <- function(
-    ms.cox, t.grid, cox.psi.se, survival.curves.data 
-) {
+cox_rmst_list <- function(
+    ms.cox, time.grid, cox.psi.se, survival.curves.data, rmst.calculation
+  ) {
   
-  # Counterfactual Survival Curves
+  #-----------------------------------   PRE   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        !is.null(ms.cox),
+        "ms.cox must be a valid fitted Cox model"
+      ),
+      contract(
+        is.numeric(time.grid),
+        "time.grid must be numeric"
+      ),
+      contract(
+        length(time.grid) > 0,
+        "time.grid must contain at least one point"
+      ),
+      contract(
+        all(diff(time.grid) > 0),
+        "time.grid must be strictly increasing"
+      ),
+      contract(
+        is.numeric(cox.psi.se) && length(cox.psi.se) == 1,
+        "cox.psi.se must be a single numeric value"
+      ),
+      contract(
+        is.data.frame(survival.curves.data),
+        "survival.curves.data must be a data.frame"
+      ),
+      contract(
+        is.function(rmst.calculation),
+        "rmst.calculation must be a function"
+      )
+    )
+  )
+  #-----------------------------------   PRE   --------------------------------#
   
-  ## Estimate the counterfactual survival curves under both treatment levels
-  ## from the fitted marginal structural Cox model
-  sf <- survfit(
+  # Counter-factual Survival Curves
+  surv <- survival::survfit(
     ms.cox,
     newdata = survival.curves.data
   )
   
-  ## Interpolate the counterfactual survival curve under no RHC onto the
-  ## specified time grid
+  # Interpolate the Counter-factual survival curve under no RHC onto
+  # the specified time grid
   S0 <- approx(
-    sf$time,
-    sf$surv[, 1],
-    t.grid,
+    surv$time,
+    surv$surv[, 1],
+    time.grid,
     method = "constant",
     rule = 2
   )$y
   
-  ## Interpolate the counterfactual survival curve under RHC onto the
-  ## specified time grid
+  # Interpolate the Counter-factual survival curve under RHC onto
+  # the specified time grid
   S1 <- approx(
-    sf$time,
-    sf$surv[, 2],
-    t.grid,
+    surv$time,
+    surv$surv[, 2],
+    time.grid,
     method = "constant",
     rule = 2
   )$y
   
   # RMST Contrast
-  
-  ## Calculate the RMST contrast as the difference between the restricted mean
-  ## survival under RHC and no RHC
-  cox.rmst <- rmst.fn(t.grid, S1) - rmst.fn(t.grid, S0)
+  rmst <- rmst.calculation(time.grid, S1) -
+    rmst.calculation(time.grid, S0)
   
   # Delta-Method Standard Error
-  
-  ## Construct the gradient of the RMST functional with respect to the
-  ## treatment log-hazard coefficient. For the Cox model, the derivative
-  ## involves the integral of S1(t) log{S1(t)} over the restriction period.
   integrand <- ifelse(S1 > 0, S1 * log(S1), 0)
-  g.cox <- rmst.fn(t.grid, integrand)
+  cox.gradient <- rmst.calculation(time.grid, integrand)
   
-  ## Propagate uncertainty from the estimated Cox treatment coefficient to the
-  ## RMST contrast using the delta method
-  cox.rmst.se <- abs(g.cox) * cox.psi.se
+  rmst.se <- abs(cox.gradient) * cox.psi.se
   
-  return(list(
-    cox.rmst = cox.rmst,
-    cox.rmst.se = cox.rmst.se
-  ))
+  result <- list(
+    rmst = rmst,
+    rmst.se = rmst.se
+  )
+  
+  #-----------------------------------  POST   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.list(result),
+        "result must be a list"
+      ),
+      contract(
+        is.numeric(result$rmst),
+        "rmst must be numeric"
+      ),
+      contract(
+        length(result$rmst) == length(time.grid),
+        "rmst must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(result$rmst.se),
+        "rmst.se must be numeric"
+      ),
+      contract(
+        length(result$rmst.se) == length(time.grid),
+        "rmst.se must have the same length as time.grid"
+      )
+    )
+  )
+  #-----------------------------------  POST   --------------------------------#
+  
+  return(result)
+}
+```
+
+\newpage
+# casebase Counter-factual Survival Function
+```{r}
+## Construct the Counter-factual survival function under treatment level a
+## directly from the case-base model's design matrix
+casebase_surv <- function(beta, a, time.grid, term.formula) {
+  
+  #-----------------------------------   PRE   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.numeric(beta),
+        "beta must be numeric"
+      ),
+      contract(
+        is.numeric(a) && length(a) == 1,
+        "a must be a single numeric value"
+      ),
+      contract(
+        is.numeric(time.grid),
+        "time.grid must be numeric"
+      ),
+      contract(
+        length(time.grid) > 0,
+        "time.grid must contain at least one point"
+      ),
+      contract(
+        all(diff(time.grid) > 0),
+        "time.grid must be strictly increasing"
+      ),
+      contract(
+        inherits(try(formula(term.formula), silent = TRUE), "formula"),
+        "term.formula must be a valid formula"
+      )
+    )
+  )
+  #-----------------------------------   PRE   --------------------------------#
+  
+  ## Create prediction data over the specified time grid under treatment
+  ## level a
+  new.data <- data.frame(
+    time = time.grid,
+    A = a,
+    offset = 0
+  )
+  
+  ## Construct the model matrix using the same terms as the fitted model and
+  ## align its columns with the estimated coefficient vector
+  covariates <- model.matrix(term.formula, data = new.data)
+  covariates <- covariates[, names(beta), drop = FALSE]
+  
+  ## Convert the linear predictor to the estimated hazard function
+  lambda <- exp(as.vector(covariates %*% beta))
+  
+  ## Numerically integrate the estimated hazard using the trapezoidal rule
+  ## to obtain the cumulative hazard
+  Lambda <- c(
+    0,
+    cumsum(
+      diff(time.grid) * (head(lambda, -1) + tail(lambda, -1)) / 2
+    )
+  )
+  
+  ## Convert cumulative hazard to survival probability
+  result <- exp(-Lambda)
+  
+  #-----------------------------------  POST   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.numeric(result),
+        "casebase_surv must return a numeric vector"
+      ),
+      contract(
+        length(result) == length(time.grid),
+        "casebase_surv result must have the same length as time.grid"
+      ),
+      contract(
+        all(result >= 0 & result <= 1, na.rm = TRUE),
+        "casebase_surv result must contain values between 0 and 1"
+      ),
+      contract(
+        result[1] == 1,
+        "casebase_surv result must start at 1"
+      )
+    )
+  )
+  #-----------------------------------  POST   --------------------------------#
+  
+  return(result)
+}
+```
+
+\newpage
+# RMST Contrast
+```{r}
+## Define the RMST contrast as a function of the model coefficient vector.
+## This function is subsequently used to obtain the numerical gradient
+## required for the delta-method standard error.
+rmst_diff <- function(
+    beta, time.grid, casebase.surv, rmst.calculation, term.formula
+  ) {
+  
+  #-----------------------------------   PRE   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.numeric(beta),
+        "beta must be numeric"
+      ),
+      contract(
+        is.numeric(time.grid),
+        "time.grid must be numeric"
+      ),
+      contract(
+        length(time.grid) > 0,
+        "time.grid must contain at least one point"
+      ),
+      contract(
+        all(diff(time.grid) > 0),
+        "time.grid must be strictly increasing"
+      ),
+      contract(
+        is.function(casebase.surv),
+        "casebase.surv must be a function"
+      ),
+      contract(
+        is.function(rmst.calculation),
+        "rmst.calculation must be a function"
+      ),
+      contract(
+        inherits(try(formula(term.formula), silent = TRUE), "formula"),
+        "term.formula must be a valid formula"
+      )
+    )
+  )
+  #-----------------------------------   PRE   --------------------------------#
+  
+  rmst.A1 <- rmst.calculation(
+    time = time.grid,
+    surv = casebase.surv(
+      beta = beta,
+      a = 1,
+      time.grid = time.grid,
+      term.formula = term.formula
+    )
+  )
+  
+  rmst.A0 <- rmst.calculation(
+    time = time.grid,
+    surv = casebase.surv(
+      beta = beta,
+      a = 0,
+      time.grid = time.grid,
+      term.formula = term.formula
+    )
+  )
+  
+  result <- rmst.A1 - rmst.A0
+  
+  #-----------------------------------  POST   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.numeric(result),
+        "RMST difference must be numeric"
+      ),
+      contract(
+        length(result) == length(time.grid),
+        "RMST difference must have the same length as time.grid"
+      )
+    )
+  )
+  #-----------------------------------  POST   --------------------------------#
+  
+  return(result)
 }
 ```
 
@@ -1231,496 +1781,1618 @@ cox.rmst.list <- function(
 ## Calculate the RMST contrast and its standard error from the IPW case-base
 ## model. The survival curves are reconstructed from the fitted model and the
 ## variance of the RMST contrast is obtained using a numerical delta method.
-cb.rmst.list <- function(cb.ipw, cb.var, t.grid, constant.HR) {
+casebase_rmst_list <- function(
+    casebase.ipw, casebase.var, time.grid, constant.HR,
+    casebase.surv, rmst.diff, rmst.calculation  
+  ) {
+  
+  #-----------------------------------   PRE   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        !is.null(casebase.ipw),
+        "casebase.ipw must be a fitted model"
+      ),
+      contract(
+        is.numeric(casebase.var),
+        "casebase.var must be numeric"
+      ),
+      contract(
+        is.numeric(time.grid),
+        "time.grid must be numeric"
+      ),
+      contract(
+        length(time.grid) > 0,
+        "time.grid must contain at least one point"
+      ),
+      contract(
+        all(diff(time.grid) > 0),
+        "time.grid must be strictly increasing"
+      ),
+      contract(
+        is.logical(constant.HR) && length(constant.HR) == 1,
+        "constant.HR must be a single logical value"
+      ),
+      contract(
+        is.function(casebase.surv),
+        "casebase.surv must be a function"
+      ),
+      contract(
+        is.function(rmst.diff),
+        "rmst.diff must be a function"
+      ),
+      contract(
+        is.function(rmst.calculation),
+        "rmst.calculation must be a function"
+      )
+    )
+  )
+  #-----------------------------------   PRE   --------------------------------#
   
   ## Extract the estimated model coefficients and the corresponding model
   ## terms used to construct the design matrix
-  beta.hat <- coef(cb.ipw)
-  term.form <- delete.response(terms(cb.ipw))
-  
-  # Counterfactual Survival Function
-  
-  ## Construct the counterfactual survival function under treatment level a
-  ## directly from the case-base model's design matrix
-  cb.surv <- function(beta, a, grid) {
-    
-    ## Create prediction data over the specified time grid under treatment
-    ## level a
-    nd <- data.frame(
-      time = grid,
-      A = a,
-      offset = 0
-    )
-    
-    ## Construct the model matrix using the same terms as the fitted model and
-    ## align its columns with the estimated coefficient vector
-    X <- model.matrix(term.form, data = nd)
-    X <- X[, names(beta), drop = FALSE]
-    
-    ## Convert the linear predictor to the estimated hazard function
-    lambda <- exp(as.vector(X %*% beta))
-    
-    ## Numerically integrate the estimated hazard using the trapezoidal rule
-    ## to obtain the cumulative hazard
-    Lambda <- c(
-      0,
-      cumsum(
-        diff(grid) * (head(lambda, -1) + tail(lambda, -1)) / 2
-      )
-    )
-    
-    ## Convert cumulative hazard to survival probability
-    exp(-Lambda)
-  }
-  
-  # RMST Contrast
-  
-  ## Define the RMST contrast as a function of the model coefficient vector.
-  ## This function is subsequently used to obtain the numerical gradient
-  ## required for the delta-method standard error.
-  rmst.diff <- function(beta) {
-    rmst.fn(t.grid, cb.surv(beta, 1, t.grid)) -
-      rmst.fn(t.grid, cb.surv(beta, 0, t.grid))
-  }
+  beta.hat <- coef(casebase.ipw)
+  term.formula <- delete.response(terms(casebase.ipw))
   
   ## Evaluate the RMST contrast at the estimated model coefficients
-  cb.rmst <- rmst.diff(beta.hat)
+  rmst <- rmst.diff(
+    beta = beta.hat,
+    time.grid = time.grid,
+    casebase.surv = casebase.surv,
+    rmst.calculation = rmst.calculation,
+    term.formula = term.formula
+  )
   
   # Numerical Gradient
   
   ## Calculate the numerical gradient of the RMST contrast with respect to
   ## each model coefficient using a central finite-difference approximation
-  p <- length(beta.hat)
-  m <- length(t.grid)
+  num.coefs <- length(beta.hat)
+  num.time.points <- length(time.grid)
   
-  grad <- matrix(NA_real_, nrow = m, ncol = p)
-  colnames(grad) <- names(beta.hat)
+  gradient <- matrix(NA_real_, nrow = num.time.points, ncol = num.coefs)
+  colnames(gradient) <- names(beta.hat)
   
   ## Step size used for the finite-difference approximation
-  eps <- 1e-6
+  step.size <- 1e-6
   
   ## Perturb each coefficient in turn and approximate the corresponding
   ## derivative of the RMST contrast
-  for (j in seq_len(p)) {
-    bp <- bm <- beta.hat
-    bp[j] <- bp[j] + eps
-    bm[j] <- bm[j] - eps
+  for (j in seq_len(num.coefs)) {
+    beta.plus <- beta.minus <- beta.hat
+    beta.plus[j] <- beta.plus[j] + step.size
+    beta.minus[j] <- beta.minus[j] - step.size
     
-    grad[, j] <- (rmst.diff(bp) - rmst.diff(bm)) / (2 * eps)
+    rmst.beta.plus <- rmst.diff(
+      beta = beta.plus,
+      time.grid = time.grid,
+      casebase.surv = casebase.surv,
+      rmst.calculation = rmst.calculation,
+      term.formula = term.formula
+    )
+    
+    rmst.beta.minus <- rmst.diff(
+      beta = beta.minus,
+      time.grid = time.grid,
+      casebase.surv = casebase.surv,
+      rmst.calculation = rmst.calculation,
+      term.formula = term.formula
+    )
+    
+    gradient[, j] <- (rmst.beta.plus - rmst.beta.minus) / (2 * step.size)
   }
   
   # Delta-Method Standard Error
   
   ## Align the model covariance matrix with the coefficient ordering used by
   ## the numerical gradient before applying the delta-method variance formula
-  cb.var <- cb.var[colnames(grad), colnames(grad), drop = FALSE]
+  casebase.var <- casebase.var[colnames(gradient), colnames(gradient), drop = FALSE]
   
   ## Calculate the RMST standard error at each restriction time using
-  ## Var{g(beta)} = grad' Var(beta) grad
-  cb.rmst.se <- vapply(
-    seq_len(m),
+  ## Var{g(beta)} = gradient' Var(beta) gradient
+  rmst.se <- vapply(
+    seq_len(num.time.points),
     function(i) {
-      g <- grad[i, ]
-      sqrt(drop(t(g) %*% cb.var %*% g))
+      gradient.row <- gradient[i, ]
+      sqrt(drop(t(gradient.row) %*% casebase.var %*% gradient.row))
     },
     numeric(1)
   )
   
-  return(list(
-    cb.rmst = cb.rmst,
-    cb.rmst.se = cb.rmst.se
-  ))
+  result <- list(
+    rmst = rmst,
+    rmst.se = rmst.se
+  )
+  
+  #-----------------------------------  POST   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.list(result),
+        "result must be a list"
+      ),
+      contract(
+        is.numeric(result$rmst),
+        "rmst must be numeric"
+      ),
+      contract(
+        length(result$rmst) == length(time.grid),
+        "rmst must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(result$rmst.se),
+        "rmst.se must be numeric"
+      ),
+      contract(
+        length(result$rmst.se) == length(time.grid),
+        "rmst.se must have the same length as time.grid"
+      )
+    )
+  )
+  #-----------------------------------  POST   --------------------------------#
+  
+  return(result)
 }
 ``` 
 
 \newpage
-# Counterfactual Survival Curves: MS-Cox and IPW Case-Base Models
+# Counter-factual Survival Curves: MS-Cox and IPW Case-Base Models
 
-# MS-Cox Counterfactual Survival Curves
-```{r, cache=TRUE}
-## Estimate counterfactual survival under both treatment levels using the
-## marginal structural Cox model. A = 0 corresponds to no RHC, while A = 1
-## corresponds to RHC.
-sf.cox <- survfit(
-  model.5,
-  newdata = survival.curves.data
-)
-
-## Interpolate the estimated survival curve under no RHC onto the common
-## time grid used for subsequent comparison and RMST calculation
-S0.cox <- approx(
-  sf.cox$time,
-  sf.cox$surv[, 1],
-  xout = tau.grid,
-  method = "constant",
-  rule = 2
-)$y
-
-## Interpolate the corresponding lower 95% confidence limit under no RHC
-S0.lower.cox <- approx(
-  sf.cox$time,
-  sf.cox$lower[, 1],
-  xout = tau.grid,
-  method = "constant",
-  rule = 2
-)$y
-
-## Interpolate the corresponding upper 95% confidence limit under no RHC
-S0.upper.cox <- approx(
-  sf.cox$time,
-  sf.cox$upper[, 1],
-  xout = tau.grid,
-  method = "constant",
-  rule = 2
-)$y
-
-## Interpolate the estimated survival curve under RHC onto the common time grid
-S1.cox <- approx(
-  sf.cox$time,
-  sf.cox$surv[, 2],
-  xout = tau.grid,
-  method = "constant",
-  rule = 2
-)$y
-
-## Interpolate the corresponding lower 95% confidence limit under RHC
-S1.lower.cox <- approx(
-  sf.cox$time,
-  sf.cox$lower[, 2],
-  xout = tau.grid,
-  method = "constant",
-  rule = 2
-)$y
-
-## Interpolate the corresponding upper 95% confidence limit under RHC
-S1.upper.cox <- approx(
-  sf.cox$time,
-  sf.cox$upper[, 2],
-  xout = tau.grid,
-  method = "constant",
-  rule = 2
-)$y
+# Calculate Counter-factual Survival Curves Function (MS-Cox)
+```{r}
+cox_csc <- function(model, new.data, time.grid) {
+  
+  #-----------------------------------   PRE   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        !is.null(model),
+        "model must be a valid fitted model"
+      ),
+      contract(
+        is.data.frame(new.data),
+        "new.data must be a data.frame"
+      ),
+      contract(
+        is.numeric(time.grid),
+        "time.grid must be numeric"
+      ),
+      contract(
+        length(time.grid) > 0,
+        "time.grid must contain at least one point"
+      ),
+      contract(
+        all(diff(time.grid) > 0),
+        "time.grid must be strictly increasing"
+      )
+    )
+  )
+  #-----------------------------------   PRE   --------------------------------#
+  
+  surv <- survival::survfit(
+    model,
+    newdata = new.data
+  )
+  
+  ## Interpolate the estimated survival curve under no RHC onto the common
+  ## time grid used for subsequent comparison and RMST calculation
+  S0 <- approx(
+    surv$time,
+    surv$surv[, 1],
+    xout = time.grid,
+    method = "constant",
+    rule = 2
+  )$y
+  
+  ## Interpolate the corresponding lower 95% confidence limit under no RHC
+  S0.lower <- approx(
+    surv$time,
+    surv$lower[, 1],
+    xout = time.grid,
+    method = "constant",
+    rule = 2
+  )$y
+  
+  ## Interpolate the corresponding upper 95% confidence limit under no RHC
+  S0.upper <- approx(
+    surv$time,
+    surv$upper[, 1],
+    xout = time.grid,
+    method = "constant",
+    rule = 2
+  )$y
+  
+  ## Interpolate the estimated survival curve under RHC onto the common time grid
+  S1 <- approx(
+    surv$time,
+    surv$surv[, 2],
+    xout = time.grid,
+    method = "constant",
+    rule = 2
+  )$y
+  
+  ## Interpolate the corresponding lower 95% confidence limit under RHC
+  S1.lower <- approx(
+    surv$time,
+    surv$lower[, 2],
+    xout = time.grid,
+    method = "constant",
+    rule = 2
+  )$y
+  
+  ## Interpolate the corresponding upper 95% confidence limit under RHC
+  S1.upper <- approx(
+    surv$time,
+    surv$upper[, 2],
+    xout = time.grid,
+    method = "constant",
+    rule = 2
+  )$y
+  
+  result <- list(
+    S0 = S0,
+    S0.lower = S0.lower, S0.upper = S0.upper,
+    S1 = S1,
+    S1.lower = S1.lower, S1.upper = S1.upper
+  )
+  
+  #-----------------------------------  POST   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.numeric(result$S0),
+        "S0 must be numeric"
+      ),
+      contract(
+        length(result$S0) == length(time.grid),
+        "S0 must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(result$S0.lower),
+        "S0.lower must be numeric"
+      ),
+      contract(
+        length(result$S0.lower) == length(time.grid),
+        "S0.lower must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(result$S0.upper),
+        "S0.upper must be numeric"
+      ),
+      contract(
+        length(result$S0.upper) == length(time.grid),
+        "S0.upper must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(result$S1),
+        "S1 must be numeric"
+      ),
+      contract(
+        length(result$S1) == length(time.grid),
+        "S1 must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(result$S1.lower),
+        "S1.lower must be numeric"
+      ),
+      contract(
+        length(result$S1.lower) == length(time.grid),
+        "S1.lower must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(result$S1.upper),
+        "S1.upper must be numeric"
+      ),
+      contract(
+        length(result$S1.upper) == length(time.grid),
+        "S1.upper must have the same length as time.grid"
+      ),
+      contract(
+        all(
+          result$S0.lower <= result$S0 &
+          result$S0 <= result$S0.upper,
+          na.rm = TRUE
+        ),
+        "S0 must satisfy lower <= estimate <= upper"
+      ),
+      contract(
+        all(
+          result$S1.lower <= result$S1 &
+          result$S1 <= result$S1.upper,
+          na.rm = TRUE
+        ),
+        "S1 must satisfy lower <= estimate <= upper"
+      )
+    )
+  )
+  #-----------------------------------  POST   --------------------------------#
+  
+  return(result)
+}
 ```
 
 \newpage
-# IPW Case-Base Counterfactual Survival Curves
-```{r, cache=TRUE, message=FALSE, warning=FALSE}
-## Estimate counterfactual survival under no RHC and RHC using the IPW
-## case-base model over the common time grid
-Sf.cb <- absoluteRisk(
-  object = model.8,
-  time = tau.grid,
-  newdata = survival.curves.data,
-  type = "survival"
-)
-
-## Extract the estimated survival curves for no RHC and RHC, respectively
-S0.cb <- Sf.cb[, 2]
-S1.cb <- Sf.cb[, 3]
-
-# Bootstrap Confidence Intervals for the IPW Case-Base Curves
-
-## Use nonparametric bootstrap resampling to obtain pointwise confidence
-## intervals for the counterfactual survival curves estimated by the IPW
-## case-base model
-set.seed(s)
-n.boot <- 200
-
-## For each bootstrap sample, refit the IPW case-base model and obtain
-## counterfactual survival estimates under both treatment levels
-boot.surv <- replicate(n.boot, {
-  idx <- sample(nrow(data.set), replace = TRUE)
-  boot.data <- data.set[idx, ]
+# Calculate Counter-factual Survival Curves Function (Case Base)
+```{r}
+casebase_csc <- function(
+    seed, data.set, model, weights, new.data, time.grid, FSH  
+  ) {
   
-  boot.fit <- FSH(
-    Delta ~ pspline(time, df = 2) * A,
-    data = boot.data,
-    ratio = 10,
-    w = ipw.stabilized[idx]
+  #-----------------------------------   PRE   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.numeric(seed) && length(seed) == 1,
+        "seed must be a single numeric value"
+      ),
+      contract(
+        is.data.frame(data.set),
+        "data.set must be a data.frame"
+      ),
+      contract(
+        !is.null(model),
+        "model must be a valid fitted model"
+      ),
+      contract(
+        is.numeric(weights),
+        "weights must be numeric"
+      ),
+      contract(
+        length(weights) == nrow(data.set),
+        "weights must have the same length as the number of rows in data.set"
+      ),
+      contract(
+        all(!is.na(weights)),
+        "weights must not contain missing values"
+      ),
+      contract(
+        is.data.frame(new.data),
+        "new.data must be a data.frame"
+      ),
+      contract(
+        is.numeric(time.grid),
+        "time.grid must be numeric"
+      ),
+      contract(
+        length(time.grid) > 0,
+        "time.grid must contain at least one point"
+      ),
+      contract(
+        all(diff(time.grid) > 0),
+        "time.grid must be strictly increasing"
+      ),
+      contract(
+        is.function(FSH),
+        "FSH must be a function"
+      )
+    )
   )
+  #-----------------------------------   PRE   --------------------------------#
   
-  ar <- absoluteRisk(
-    boot.fit,
-    time = tau.grid,
-    newdata = survival.curves.data,
+  surv <- casebase::absoluteRisk(
+    object = model,
+    time = time.grid,
+    newdata = new.data,
     type = "survival"
   )
   
-  list(
-    S0 = ar[, 2],
-    S1 = ar[, 3]
+  ## Extract the estimated survival curves for no RHC and RHC, respectively
+  S0 <- surv[, 2]
+  S1 <- surv[, 3]
+  
+  # Bootstrap Confidence Intervals for the IPW Case-Base Curves
+  
+  ## Use nonparametric bootstrap resampling to obtain pointwise confidence
+  ## intervals for the Counter-factual survival curves estimated by the IPW
+  ## case-base model
+  set.seed(seed)
+  num.samples <- 200
+  
+  ## For each bootstrap sample, refit the IPW case-base model and obtain
+  ## Counter-factual survival estimates under both treatment levels
+  bootstrap <- replicate(num.samples, {
+    boot.idx <- sample(nrow(data.set), replace = TRUE)
+    boot.data <- data.set[boot.idx, ]
+    
+    boot.fit <- FSH(
+      Delta ~ survival::pspline(time, df = 2) * A,
+      data = boot.data,
+      ratio = 10,
+      weights = weights[boot.idx]
+    )
+    
+    boot.surv <- casebase::absoluteRisk(
+      boot.fit,
+      time = time.grid,
+      newdata = new.data,
+      type = "survival"
+    )
+    
+    list(
+      S0 = boot.surv[, 2],
+      S1 = boot.surv[, 3]
+    )
+  })
+  
+  ## Organize the bootstrap estimates into separate matrices for the no-RHC
+  ## and RHC Counter-factual survival curves
+  S0.boot <- sapply(1:num.samples, function(i) bootstrap[["S0", i]])
+  S1.boot <- sapply(1:num.samples, function(i) bootstrap[["S1", i]])
+  
+  ## Calculate the pointwise lower 95% bootstrap confidence limit for the
+  ## no-RHC Counter-factual survival curve
+  S0.lower <- apply(
+    S0.boot,
+    1,
+    quantile,
+    probs = 0.025,
+    na.rm = TRUE
   )
-})
-
-## Organize the bootstrap estimates into separate matrices for the no-RHC
-## and RHC counterfactual survival curves
-S0.boot <- sapply(1:n.boot, function(i) boot.surv[["S0", i]])
-S1.boot <- sapply(1:n.boot, function(i) boot.surv[["S1", i]])
-
-## Calculate the pointwise lower 95% bootstrap confidence limit for the
-## no-RHC counterfactual survival curve
-S0.lower.cb <- apply(
-  S0.boot,
-  1,
-  quantile,
-  probs = 0.025,
-  na.rm = TRUE
-)
-
-## Calculate the pointwise upper 95% bootstrap confidence limit for the
-## no-RHC counterfactual survival curve
-S0.upper.cb <- apply(
-  S0.boot,
-  1,
-  quantile,
-  probs = 0.975,
-  na.rm = TRUE
-)
-
-## Calculate the pointwise lower 95% bootstrap confidence limit for the
-## RHC counterfactual survival curve
-S1.lower.cb <- apply(
-  S1.boot,
-  1,
-  quantile,
-  probs = 0.025,
-  na.rm = TRUE
-)
-
-## Calculate the pointwise upper 95% bootstrap confidence limit for the
-## RHC counterfactual survival curve
-S1.upper.cb <- apply(
-  S1.boot,
-  1,
-  quantile,
-  probs = 0.975,
-  na.rm = TRUE
-)
+  
+  ## Calculate the pointwise upper 95% bootstrap confidence limit for the
+  ## no-RHC Counter-factual survival curve
+  S0.upper <- apply(
+    S0.boot,
+    1,
+    quantile,
+    probs = 0.975,
+    na.rm = TRUE
+  )
+  
+  ## Calculate the pointwise lower 95% bootstrap confidence limit for the
+  ## RHC Counter-factual survival curve
+  S1.lower <- apply(
+    S1.boot,
+    1,
+    quantile,
+    probs = 0.025,
+    na.rm = TRUE
+  )
+  
+  ## Calculate the pointwise upper 95% bootstrap confidence limit for the
+  ## RHC Counter-factual survival curve
+  S1.upper <- apply(
+    S1.boot,
+    1,
+    quantile,
+    probs = 0.975,
+    na.rm = TRUE
+  )
+  
+  result <- list(
+    S0 = S0,
+    S0.lower = S0.lower, S0.upper = S0.upper,
+    S1 = S1,
+    S1.lower = S1.lower, S1.upper = S1.upper
+  )
+  
+  #-----------------------------------  POST   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.numeric(result$S0),
+        "S0 must be numeric"
+      ),
+      contract(
+        length(result$S0) == length(time.grid),
+        "S0 must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(result$S0.lower),
+        "S0.lower must be numeric"
+      ),
+      contract(
+        length(result$S0.lower) == length(time.grid),
+        "S0.lower must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(result$S0.upper),
+        "S0.upper must be numeric"
+      ),
+      contract(
+        length(result$S0.upper) == length(time.grid),
+        "S0.upper must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(result$S1),
+        "S1 must be numeric"
+      ),
+      contract(
+        length(result$S1) == length(time.grid),
+        "S1 must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(result$S1.lower),
+        "S1.lower must be numeric"
+      ),
+      contract(
+        length(result$S1.lower) == length(time.grid),
+        "S1.lower must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(result$S1.upper),
+        "S1.upper must be numeric"
+      ),
+      contract(
+        length(result$S1.upper) == length(time.grid),
+        "S1.upper must have the same length as time.grid"
+      ),
+      contract(
+        all(
+          result$S0.lower <= result$S0 &
+          result$S0 <= result$S0.upper,
+          na.rm = TRUE
+        ),
+        "S0 must satisfy lower <= estimate <= upper"
+      ),
+      contract(
+        all(
+          result$S1.lower <= result$S1 &
+          result$S1 <= result$S1.upper,
+          na.rm = TRUE
+        ),
+        "S1 must satisfy lower <= estimate <= upper"
+      )
+    )
+  )
+  #-----------------------------------  POST   --------------------------------#
+  
+  return(result)
+}
 ```
 
-# Head-to-Head Comparison of Counterfactual Survival Curves
+\newpage
+# Plot Counter-factual Survival Curves
 ```{r}
-## Compare the MS-Cox and IPW case-base estimates separately under each
-## treatment condition. The confidence bands are plotted first so that the
-## survival curves remain visible on top of the shaded regions.
-
-# Counterfactual Survival Under No RHC
-
-## Initialize the plotting region for the counterfactual survival curves
-## under no RHC (A = 0)
-plot(
-  tau.grid, S0.cox,
-  type = "n",
-  lwd = 2,
-  col = col.cox,
-  lty = 1,
-  ylim = c(0, 1),
-  xlab = "Time",
-  ylab = "Survival Probability",
-  main = "Counterfactual Survival Curves (No RHC)"
-)
-
-## Add the 95% confidence band for the MS-Cox survival estimate
-polygon(
-  c(tau.grid, rev(tau.grid)),
-  c(S0.lower.cox, rev(S0.upper.cox)),
-  col = fill.cox,
-  border = NA
-)
-
-## Add the 95% bootstrap confidence band for the IPW case-base survival
-## estimate
-polygon(
-  c(tau.grid, rev(tau.grid)),
-  c(S0.lower.cb, rev(S0.upper.cb)),
-  col = fill.cb,
-  border = NA
-)
-
-## Overlay the estimated survival curves. The MS-Cox curve is a step function,
-## whereas the case-base model produces a smooth survival curve.
-lines(S0.cox, type = "s", lwd = 2, col = col.cox, lty = 1)
-lines(S0.cb, type = "l", lwd = 2, col = col.cb, lty = 1)
-
-## Identify the two estimation approaches in the comparison plot
-legend(
-  "topright",
-  legend = c(
-    "Semi-Parametric: MS-Cox",
-    "Parametric: Case Base"
-  ),
-  col = c(
-    col.cox, col.cb
-  ),
-  lty = c(1, 1),
-  lwd = 2,
-  bty = "n"
-)
-
-# Counterfactual Survival Under RHC
-
-## Initialize the plotting region for the counterfactual survival curves
-## under RHC (A = 1)
-plot(
-  tau.grid, S1.cox,
-  type = "n",
-  lwd = 2,
-  col = col.cox,
-  lty = 1,
-  ylim = c(0, 1),
-  xlab = "Time",
-  ylab = "Survival Probability",
-  main = "Counterfactual Survival Curves (RHC)"
-)
-
-## Add the 95% confidence band for the MS-Cox survival estimate
-polygon(
-  c(tau.grid, rev(tau.grid)),
-  c(S1.lower.cox, rev(S1.upper.cox)),
-  col = fill.cox,
-  border = NA
-)
-
-## Add the 95% bootstrap confidence band for the IPW case-base survival
-## estimate
-polygon(
-  c(tau.grid, rev(tau.grid)),
-  c(S1.lower.cb, rev(S1.upper.cb)),
-  col = fill.cb,
-  border = NA
-)
-
-## Overlay the estimated survival curves under RHC
-lines(S1.cox, type = "s", lwd = 2, col = col.cox, lty = 1)
-lines(S1.cb, type = "l", lwd = 2, col = col.cb, lty = 1)
-
-## Identify the two estimation approaches in the comparison plot
-legend(
-  "topright",
-  legend = c(
-    "Semi-Parametric: MS-Cox",
-    "Parametric: Case Base"
-  ),
-  col = c(
-    col.cox, col.cb
-  ),
-  lty = c(1, 1),
-  lwd = 2,
-  bty = "n"
-)
+plot_csc <- function(
+    time.grid,
+    S0, S0.lower, S0.upper,
+    S1, S1.lower, S1.upper,
+    main.title,
+    fills, cols
+  ) {
+  
+  #-----------------------------------   PRE   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.numeric(time.grid),
+        "time.grid must be numeric"
+      ),
+      contract(
+        length(time.grid) > 0,
+        "time.grid must contain at least one point"
+      ),
+      contract(
+        all(diff(time.grid) > 0),
+        "time.grid must be strictly increasing"
+      ),
+      contract(
+        is.numeric(S0),
+        "S0 must be numeric"
+      ),
+      contract(
+        length(S0) == length(time.grid),
+        "S0 must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(S0.lower),
+        "S0.lower must be numeric"
+      ),
+      contract(
+        length(S0.lower) == length(time.grid),
+        "S0.lower must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(S0.upper),
+        "S0.upper must be numeric"
+      ),
+      contract(
+        length(S0.upper) == length(time.grid),
+        "S0.upper must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(S1),
+        "S1 must be numeric"
+      ),
+      contract(
+        length(S1) == length(time.grid),
+        "S1 must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(S1.lower),
+        "S1.lower must be numeric"
+      ),
+      contract(
+        length(S1.lower) == length(time.grid),
+        "S1.lower must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(S1.upper),
+        "S1.upper must be numeric"
+      ),
+      contract(
+        length(S1.upper) == length(time.grid),
+        "S1.upper must have the same length as time.grid"
+      ),
+      contract(
+        all(
+          S0.lower <= S0 &
+          S0 <= S0.upper,
+          na.rm = TRUE
+        ),
+        "S0 must satisfy lower <= estimate <= upper"
+      ),
+      contract(
+        all(
+          S1.lower <= S1 &
+          S1 <= S1.upper,
+          na.rm = TRUE
+        ),
+        "S1 must satisfy lower <= estimate <= upper"
+      ),
+      contract(
+        is.character(main.title) && length(main.title) == 1,
+        "main.title must be a single string"
+      ),
+      contract(
+        is.character(fills),
+        "fills must be a character vector"
+      ),
+      contract(
+        length(fills) >= 2,
+        "fills must contain at least two elements"
+      ),
+      contract(
+        is.character(cols),
+        "cols must be a character vector"
+      ),
+      contract(
+        length(cols) >= 2,
+        "cols must contain at least two elements"
+      )
+    )
+  )
+  #-----------------------------------   PRE   --------------------------------#
+  
+  plot(
+    NA,
+    xlim = range(time.grid),
+    ylim = c(0, 1),
+    type = "n",
+    xlab = "Time",
+    ylab = "Survival Probability",
+    main = main.title
+  )
+  
+  ## Add the 95% confidence bands
+  polygon(
+    c(time.grid, rev(time.grid)),
+    c(S0.lower, rev(S0.upper)),
+    col = fills[1],
+    border = NA
+  )
+  
+  polygon(
+    c(time.grid, rev(time.grid)),
+    c(S1.lower, rev(S1.upper)),
+    col = fills[2],
+    border = NA
+  )
+  
+  ## Overlay the estimated survival curves. The MS-Cox curve is a step function,
+  ## whereas the case-base model produces a smooth survival curve.
+  lines(time.grid, S0, type = "s", lwd = 2, col = cols[1], lty = 1)
+  lines(time.grid, S1, type = "s", lwd = 2, col = cols[2], lty = 1)
+  
+  ## Identify the two estimation approaches in the comparison plot
+  legend(
+    "topright",
+    legend = c("No RHC", "RHC"),
+    col = cols[1:2],
+    lty = c(1, 1),
+    lwd = 2,
+    bty = "n"
+  )
+}
 ```
 
 \newpage
 # RMST Comparison: MS-Cox vs. IPW Case-Base
-
-# RMST Estimates and Standard Errors
-```{r, cache=TRUE}
-## Extract the robust standard error of the treatment log-hazard coefficient
-## from the marginal structural Cox model
-model.5.psi.se <- sqrt(diag(vcov(model.5))["A"])
-
-## Obtain the heteroskedasticity-consistent covariance matrix for the IPW
-## case-base model. This covariance matrix is used in the numerical
-## delta-method calculation of the RMST standard error.
-model.8.var <- cb.var <- vcovHC(model.8, type = "HC0")
-
-
-## Calculate the RMST contrast and its delta-method standard error for the
-## marginal structural Cox model
-cox.rmst.list <- cox.rmst.list(
-  model.5, tau.grid, model.5.psi.se, survival.curves.data
-)
-
-## Calculate the RMST contrast and its delta-method standard error for the
-## IPW case-base model
-cb.rmst.list <- cb.rmst.list(
-  model.8, model.8.var, tau.grid, constant.HR = TRUE
-)
-
-# Extract RMST Estimates and Standard Errors
-
-## Extract the estimated RMST contrasts and their corresponding standard errors
-## from both estimation approaches
-cox.rmst <- cox.rmst.list$cox.rmst
-cox.rmst.se <- cox.rmst.list$cox.rmst.se
-
-cb.rmst <- cb.rmst.list$cb.rmst
-cb.rmst.se <- cb.rmst.list$cb.rmst.se
-
-# Pointwise 95% Confidence Intervals
-
-## Construct pointwise 95% Wald confidence intervals for the MS-Cox RMST
-## contrast over the range of restriction times
-cox.lower <- cox.rmst - 1.96 * cox.rmst.se
-cox.upper <- cox.rmst + 1.96 * cox.rmst.se
-
-## Construct pointwise 95% Wald confidence intervals for the IPW case-base
-## RMST contrast over the range of restriction times
-cb.lower <- cb.rmst - 1.96 * cb.rmst.se
-cb.upper <- cb.rmst + 1.96 * cb.rmst.se
+```{r}
+rmst_stats <- function(
+    models.list, time.grid, new.data,
+    cox.rmst.list, casebase.rmst.list,
+    rmst.calculation, rmst.diff, casebase.surv
+  ) {
+  
+  #-----------------------------------   PRE   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.list(models.list),
+        "models.list must be a list"
+      ),
+      contract(
+        length(models.list) > 0,
+        "models.list must be non-empty"
+      ),
+      contract(
+        all(c("cox", "casebase") %in% names(models.list)),
+        "models.list must contain cox and casebase models"
+      ),
+      contract(
+        is.numeric(time.grid),
+        "time.grid must be numeric"
+      ),
+      contract(
+        length(time.grid) > 0,
+        "time.grid must contain at least one point"
+      ),
+      contract(
+        all(diff(time.grid) > 0),
+        "time.grid must be strictly increasing"
+      ),
+      contract(
+        is.data.frame(new.data),
+        "new.data must be a data.frame"
+      ),
+      contract(
+        is.function(cox.rmst.list),
+        "cox.rmst.list must be a function"
+      ),
+      contract(
+        is.function(casebase.rmst.list),
+        "casebase.rmst.list must be a function"
+      ),
+      contract(
+        is.function(rmst.calculation),
+        "rmst.calculation must be a function"
+      ),
+      contract(
+        is.function(rmst.diff),
+        "rmst.diff must be a function"
+      ),
+      contract(
+        is.function(casebase.surv),
+        "casebase.surv must be a function"
+      )
+    )
+  )
+  #-----------------------------------   PRE   --------------------------------#
+  
+  cox.psi.se <- sqrt(diag(vcov(models.list$cox))["A"])
+  casebase.var <- sandwich::vcovHC(models.list$casebase, type = "HC0")
+  
+  cox.rmst.list <- cox.rmst.list(
+    ms.cox = models.list$cox,
+    time.grid = time.grid,
+    cox.psi.se = cox.psi.se,
+    survival.curves.data = new.data,
+    rmst.calculation = rmst.calculation
+  )
+  casebase.rmst.list <- casebase.rmst.list(
+    casebase.ipw = models.list$casebase,
+    casebase.var = casebase.var,
+    time.grid = time.grid,
+    casebase.surv = casebase.surv,
+    rmst.diff = rmst.diff,
+    rmst.calculation = rmst.calculation
+  )
+  
+  cox.lower <- cox.rmst.list$rmst - 1.96 * cox.rmst.list$rmst.se
+  cox.upper <- cox.rmst.list$rmst + 1.96 * cox.rmst.list$rmst.se
+  
+  casebase.lower <- casebase.rmst.list$rmst - 1.96 * casebase.rmst.list$rmst.se
+  casebase.upper <- casebase.rmst.list$rmst + 1.96 * casebase.rmst.list$rmst.se
+  
+  result <- list(
+    time.grid = time.grid,
+    cox.rmst = cox.rmst.list$rmst,
+    cox.rmst.se = cox.rmst.list$rmst.se,
+    cox.lower = cox.lower,
+    cox.upper = cox.upper,
+    casebase.rmst = casebase.rmst.list$rmst,
+    casebase.rmst.se = casebase.rmst.list$rmst.se,
+    casebase.lower = casebase.lower,
+    casebase.upper = casebase.upper
+  )
+  
+  #-----------------------------------  POST   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.numeric(result$time.grid),
+        "time.grid must be numeric"
+      ),
+      contract(
+        length(result$time.grid) == length(time.grid),
+        "time.grid must have the same length as the input time grid"
+      ),
+      contract(
+        is.numeric(result$cox.rmst),
+        "cox.rmst must be numeric"
+      ),
+      contract(
+        length(result$cox.rmst) == length(time.grid),
+        "cox.rmst must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(result$cox.rmst.se),
+        "cox.rmst.se must be numeric"
+      ),
+      contract(
+        length(result$cox.rmst.se) == length(time.grid),
+        "cox.rmst.se must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(result$cox.lower),
+        "cox.lower must be numeric"
+      ),
+      contract(
+        length(result$cox.lower) == length(time.grid),
+        "cox.lower must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(result$cox.upper),
+        "cox.upper must be numeric"
+      ),
+      contract(
+        length(result$cox.upper) == length(time.grid),
+        "cox.upper must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(result$casebase.rmst),
+        "casebase.rmst must be numeric"
+      ),
+      contract(
+        length(result$casebase.rmst) == length(time.grid),
+        "casebase.rmst must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(result$casebase.rmst.se),
+        "casebase.rmst.se must be numeric"
+      ),
+      contract(
+        length(result$casebase.rmst.se) == length(time.grid),
+        "casebase.rmst.se must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(result$casebase.lower),
+        "casebase.lower must be numeric"
+      ),
+      contract(
+        length(result$casebase.lower) == length(time.grid),
+        "casebase.lower must have the same length as time.grid"
+      ),
+      contract(
+        is.numeric(result$casebase.upper),
+        "casebase.upper must be numeric"
+      ),
+      contract(
+        length(result$casebase.upper) == length(time.grid),
+        "casebase.upper must have the same length as time.grid"
+      ),
+      contract(
+        all(
+          result$cox.lower <= result$cox.rmst &
+          result$cox.rmst <= result$cox.upper,
+          na.rm = TRUE
+        ),
+        "cox RMST must satisfy lower <= estimate <= upper"
+      ),
+      contract(
+        all(
+          result$casebase.lower <= result$casebase.rmst &
+          result$casebase.rmst <= result$casebase.upper,
+          na.rm = TRUE
+        ),
+        "case-base RMST must satisfy lower <= estimate <= upper"
+      )
+    )
+  )
+  #-----------------------------------  POST   --------------------------------#
+  
+  return(result)
+}
 ```
 
-# RMST Comparison Plot
+\newpage
+# Plot RMST Comparison
 ```{r}
-## Determine a common y-axis range that accommodates the point estimates and
-## confidence intervals from both estimation approaches
-ylim <- range(
-  c(
-    cox.lower, cox.upper,
-    cb.lower, cb.upper
+plot_rmst_comparison <- function(
+    rmst.stats,
+    fills, cols,
+    additional.title = ""
+  ) {
+  
+  #-----------------------------------   PRE   --------------------------------#
+  DbC(
+    contracts = list(
+      contract(
+        is.list(rmst.stats),
+        "rmst.stats must be a list"
+      ),
+      contract(
+        is.numeric(rmst.stats$time.grid),
+        "time.grid must be numeric"
+      ),
+      contract(
+        length(rmst.stats$time.grid) > 0,
+        "time.grid must contain at least one point"
+      ),
+      contract(
+        all(diff(rmst.stats$time.grid) > 0),
+        "time.grid must be strictly increasing"
+      ),
+      contract(
+        is.numeric(rmst.stats$cox.rmst),
+        "cox.rmst must be numeric"
+      ),
+      contract(
+        is.numeric(rmst.stats$cox.lower),
+        "cox.lower must be numeric"
+      ),
+      contract(
+        is.numeric(rmst.stats$cox.upper),
+        "cox.upper must be numeric"
+      ),
+      contract(
+        is.numeric(rmst.stats$casebase.rmst),
+        "casebase.rmst must be numeric"
+      ),
+      contract(
+        is.numeric(rmst.stats$casebase.lower),
+        "casebase.lower must be numeric"
+      ),
+      contract(
+        is.numeric(rmst.stats$casebase.upper),
+        "casebase.upper must be numeric"
+      ),
+      contract(
+        length(rmst.stats$cox.rmst) == length(rmst.stats$time.grid),
+        "cox.rmst must have the same length as time.grid"
+      ),
+      contract(
+        length(rmst.stats$cox.lower) == length(rmst.stats$time.grid),
+        "cox.lower must have the same length as time.grid"
+      ),
+      contract(
+        length(rmst.stats$cox.upper) == length(rmst.stats$time.grid),
+        "cox.upper must have the same length as time.grid"
+      ),
+      contract(
+        length(rmst.stats$casebase.rmst) == length(rmst.stats$time.grid),
+        "casebase.rmst must have the same length as time.grid"
+      ),
+      contract(
+        length(rmst.stats$casebase.lower) == length(rmst.stats$time.grid),
+        "casebase.lower must have the same length as time.grid"
+      ),
+      contract(
+        length(rmst.stats$casebase.upper) == length(rmst.stats$time.grid),
+        "casebase.upper must have the same length as time.grid"
+      ),
+      contract(
+        all(
+          rmst.stats$cox.lower <= rmst.stats$cox.rmst &
+          rmst.stats$cox.rmst <= rmst.stats$cox.upper,
+          na.rm = TRUE
+        ),
+        "ox RMST must satisfy lower <= estimate <= upper"
+      ),
+      contract(
+        all(
+          rmst.stats$casebase.lower <= rmst.stats$casebase.rmst &
+          rmst.stats$casebase.rmst <= rmst.stats$casebase.upper,
+          na.rm = TRUE
+        ),
+        "case-base RMST must satisfy lower <= estimate <= upper"
+      ),
+      contract(
+        is.character(fills),
+        "fills must be a character vector"
+      ),
+      contract(
+        length(fills) >= 2,
+        "fills must contain at least two elements"
+      ),
+      contract(
+        is.character(cols),
+        "cols must be a character vector"
+      ),
+      contract(
+        length(cols) >= 2,
+        "cols must contain at least two elements"
+      ),
+      contract(
+        is.character(additional.title) && length(additional.title) == 1,
+        "additional.title must be a single string"
+      )
+    )
+  )
+  #-----------------------------------   PRE   --------------------------------#
+  
+  ylim <- range(
+    c(
+      rmst.stats$cox.lower, rmst.stats$cox.upper,
+      rmst.stats$casebase.lower, rmst.stats$casebase.upper
+    ),
+    na.rm = TRUE
+  )
+  
+  plot(
+    NA,
+    xlim = range(rmst.stats$time.grid),
+    ylim = ylim,
+    type = "n",
+    xlab = expression(tau),
+    ylab = "RMST Difference",
+    main = paste("Causal RMST up to Tau", additional.title)
+  )
+  
+  # 95% Confidence Bands
+
+  ## Add the pointwise 95% confidence band for the MS-Cox RMST contrast
+  polygon(
+    c(rmst.stats$time.grid, rev(rmst.stats$time.grid)),
+    c(rmst.stats$cox.lower, rev(rmst.stats$cox.upper)),
+    col = fills[1],
+    border = NA
+  )
+  
+  ## Add the pointwise 95% confidence band for the IPW case-base RMST contrast
+  polygon(
+    c(rmst.stats$time.grid, rev(rmst.stats$time.grid)),
+    c(rmst.stats$casebase.lower, rev(rmst.stats$casebase.upper)),
+    col = fills[2],
+    border = NA
+  )
+  
+  # RMST Contrast Estimates
+
+  ## Overlay the estimated causal RMST contrast from the MS-Cox model
+  lines(rmst.stats$time.grid, rmst.stats$cox.rmst, col = cols[1], lwd = 2)
+  
+  ## Overlay the estimated causal RMST contrast from the IPW case-base model
+  lines(rmst.stats$time.grid, rmst.stats$casebase.rmst, col = cols[2], lwd = 2)
+  
+  ## Add a reference line at an RMST difference of zero, corresponding to equal
+  ## restricted mean survival under the two treatment conditions
+  abline(h = 0, lty = 3)
+  
+  # Model Legend
+  
+  ## Identify the two estimation approaches in the comparison plot
+  legend(
+    "bottomleft",
+    legend = c("MS-Cox", "IPW Case-Base"),
+    col = cols[1:2],
+    lwd = 2,
+    bty = "n"
+  )
+}
+```
+
+\newpage
+# Data Preparation
+```{r}
+## Set random seed for output reproducibility
+seed = 123
+```
+
+# Construct Analysis Dataset
+```{r}
+data_set <- construct_data_set()
+
+covariates_vector <- names(data_set)[-(1:4)]
+covariates_added <- paste(covariates_vector, collapse = " + ")
+```
+
+# Plotting Parameters
+```{r}
+# two main colors used in different plots
+colors <- c("black", "red", "blue", "green")
+
+# lighter shades of colors for confidence bands and overlapped plots
+fills <- adjustcolor(colors, alpha.f = 0.2)
+dark_fills <- adjustcolor(colors, alpha.f = 0.5)
+```
+
+\newpage
+# Calculate IPTW, IPCW and Combined Weights
+```{r}
+# calculate treatment propensity scores
+treatment_ps <- propensity_score(
+  data.set = data_set,
+  outcome = "A",
+  covariates = covariates_vector,
+  propensity.score.form = propensity_score_form
+)
+treatment_ps_0 <- treatment_ps[data_set$A == 0]
+treatment_ps_1 <- treatment_ps[data_set$A == 1]
+
+# calculate censoring propensity scores
+censoring_ps <- propensity_score(
+  data.set = data_set,
+  outcome = "C",
+  covariates = covariates_vector,
+  propensity.score.form = propensity_score_form,
+  additional = "A"
+)
+censoring_ps_0 <- censoring_ps[data_set$A == 0]
+censoring_ps_1 <- censoring_ps[data_set$A == 1]
+
+# calculate iptw and ipcw
+iptw <- stabilized_IPW(
+  propensity.score = treatment_ps,
+  outcome = data_set$A
+)
+
+ipcw <- stabilized_IPW(
+  propensity.score = censoring_ps,
+  outcome = data_set$C
+)
+
+# calculate combined weights
+combined_weights <- iptw * ipcw
+```
+
+\newpage
+# Plot Propensity Scores
+```{r}
+plot_propensity_scores(
+  propensity.score.0 = treatment_ps_0, propensity.score.1 = treatment_ps_1,
+  cols = colors[2:3], fills = dark_fills[2:3],
+  title = "Treatment PS Overlap"
+)
+plot_propensity_scores(
+  propensity.score.0 = censoring_ps_0, propensity.score.1 = censoring_ps_1,
+  cols = colors[2:3], fills = dark_fills[2:3],
+  title = "Censoring PS Overlap"
+)
+```
+
+\newpage
+# Plot IPW Distributions
+```{r}
+plot_ipw(
+  ipws = list(iptw, ipcw, combined_weights),
+  titles = c("IPTW", "IPCW", "Combined"),
+  cols = colors[2:4]
+)
+```
+
+\newpage
+# Descriptive Statistics: Table One
+```{r}
+# create table one for the unweighted original data set
+table_one_original <- tableone::CreateTableOne(
+  vars = covariates_vector,
+  strata = "A",
+  data = data_set,
+  test = FALSE
+)
+
+print(table_one_original, smd = TRUE)
+```
+
+\newpage
+# Weighted Table One (Intention-To-Treat)
+```{r, warning=FALSE, message=FALSE}
+weighted_table_one(
+  data.set = data_set,
+  weights = iptw,
+  covariates = covariates_vector,
+  outcome = "A"
+)
+```
+
+\newpage
+# Weighted Table One (Per-Protocol)
+```{r, warning=FALSE, message=FALSE}
+weighted_table_one(
+  data.set = data_set,
+  weights = combined_weights,
+  covariates = covariates_vector,
+  outcome = "A"
+)
+```
+
+\newpage
+# Covariate Balance Before and After Weighting
+```{r, warning=FALSE, message=FALSE}
+plot_cov_balance(
+  data.set = data_set,
+  covariates.added = covariates_added,
+  outcome = "A",
+  weights.list = list(iptw = iptw, combined = combined_weights),
+  weights.titles = c("IPTW", "Combined Weights"),
+  cols = colors[2:4]
+)
+```
+
+\newpage
+# Case-Base Model Setup
+```{r}
+## Set the case-base sampling ratio used across all case-base model fits.
+## A ratio of 100 samples 100 background person-moments per observed case.
+fsh_ratio <- 100
+```
+
+# Counter-factual Survival Curve Setup
+```{r}
+## Define the two treatment levels used to generate Counter-factual survival
+## curves: A = 0 represents no RHC and A = 1 represents RHC
+treatment_types <- c(0, 1)
+
+## Create a prediction dataset containing both treatment levels for estimation
+## of Counter-factual survival under each treatment condition
+survival_curves_data <- data.frame(A = treatment_types)
+
+# Time Grid Definition
+
+## Determine the maximum observed follow-up time in the analysis dataset
+tau_max <- max(data_set$time, na.rm = TRUE)
+
+## Restrict the primary survival-curve display to the first 150 days
+## (approximately four months) to focus on the relevant follow-up period
+focus_time <- 150
+
+## Define the time grid used for RMST integration, spanning the full observed
+## follow-up period at one-day intervals
+tau_grid <- seq(0, tau_max, by = 1)
+
+## Define the time grid used for plotting and estimating survival curves over
+## a restricted four-month follow-up period
+focused_grid <- seq(0, focus_time, by = 1)
+```
+
+\newpage
+# Model 1: Unadjusted Marginal Structural Cox Model
+```{r, cache=TRUE}
+unadjusted_cox <- fit_model(
+  fitting.function = survival::coxph,
+  formula = Surv(time, Delta) ~ A,
+  data.set = data_set,
+  seed = seed,
+  extract.print.hr = extract_print_hr,
+  se.func = vcov,
+  robust = TRUE
+)
+```
+
+\newpage
+# Model 2: Unadjusted Case-Base Model
+```{r, cache=TRUE, warning=FALSE, message=FALSE}
+unadjusted_casebase <- fit_model(
+  fitting.function = FSH,
+  formula = Delta ~ A,
+  data.set = data_set,
+  seed = seed,
+  extract.print.hr = extract_print_hr,
+  se.func = sandwich::vcovHC,
+  ratio = fsh_ratio
+)
+```
+
+\newpage
+# Model 3: Covariate-Adjusted Cox Model
+```{r, cache=TRUE}
+covariate_adjusted_cox <- fit_model(
+  fitting.function = survival::coxph,
+  formula = as.formula(
+    paste("Surv(time, Delta) ~ A +", covariates_added)
   ),
-  na.rm = TRUE
+  data.set = data_set,
+  seed = seed,
+  extract.print.hr = extract_print_hr,
+  se.func = vcov,
+  robust = TRUE
+)
+```
+
+\newpage
+# Model 4: Covariate-Adjusted Case-Base Model
+```{r, cache=TRUE, warning=FALSE, message=FALSE}
+covariate_adjusted_casebase <- fit_model(
+  fitting.function = FSH,
+  formula = as.formula(paste("Delta ~ A +", covariates_added)),
+  data.set = data_set,
+  seed = seed,
+  extract.print.hr = extract_print_hr,
+  se.func = sandwich::vcovHC,
+  ratio = fsh_ratio
+)
+```
+
+\newpage
+# Model 5: Marginal Structural Cox Model (Intention-To-Treat)
+```{r, cache=TRUE}
+ms_cox_itt <- fit_model(
+  fitting.function = survival::coxph,
+  formula = Surv(time, Delta) ~ A,
+  data.set = data_set,
+  seed = seed,
+  extract.print.hr = extract_print_hr,
+  se.func = vcov,
+  weights = iptw,
+  robust = TRUE
+)
+```
+
+# Model 5: Marginal Structural Cox Model (Per-Protocol)
+```{r, cache=TRUE}
+ms_cox_pp <- fit_model(
+  fitting.function = survival::coxph,
+  formula = Surv(time, Delta) ~ A,
+  data.set = data_set,
+  seed = seed,
+  extract.print.hr = extract_print_hr,
+  se.func = vcov,
+  weights = combined_weights,
+  robust = TRUE
+)
+```
+
+\newpage
+# Model 6: IPW Case-Base Proportional Hazards Model (Intention-To-Treat)
+```{r, cache=TRUE, warning=FALSE, message=FALSE}
+ipw_casebase_itt <- fit_model(
+  fitting.function = FSH,
+  formula = Delta ~ A,
+  data.set = data_set,
+  seed = seed,
+  extract.print.hr = extract_print_hr,
+  se.func = sandwich::vcovHC,
+  weights = iptw,
+  ratio = fsh_ratio
+)
+```
+
+# Model 6: IPW Case-Base Proportional Hazards Model (Per-Protocol)
+```{r, cache=TRUE, warning=FALSE, message=FALSE}
+ipw_casebase_pp <- fit_model(
+  fitting.function = FSH,
+  formula = Delta ~ A,
+  data.set = data_set,
+  seed = seed,
+  extract.print.hr = extract_print_hr,
+  se.func = sandwich::vcovHC,
+  weights = combined_weights,
+  ratio = fsh_ratio
+)
+```
+
+\newpage
+# Model 7: Unadjusted Case-Base Model with Time-Varying Hazard Ratio
+```{r, cache=TRUE, warning=FALSE, message=FALSE}
+unadjusted_var_hr_casebase <- fit_model(
+  fitting.function = FSH,
+  formula = Delta ~ survival::pspline(time, df = 2) * A,
+  data.set = data_set,
+  seed = seed,
+  extract.print.hr = extract_print_hr,
+  constant.HR = FALSE,
+  ratio = fsh_ratio
+)
+```
+
+\newpage
+# Time-Varying Hazard Ratio
+```{r, message=FALSE}
+plot_time_dep_hr(
+  list(unadjusted_var_hr_casebase),
+  main.title = "Unadjusted Case Base: Variable Hazard Ratio",
+  time.grid = tau_grid,
+  casebase.var.hr = casebase_var_hr
+)
+```
+
+\newpage
+# Model 8: IPW Case-Base Model with Time-Varying Hazard Ratio (Intention-To-Treat)
+```{r, cache=TRUE, warning=FALSE, message=FALSE}
+ipw_var_hr_casebase_itt <- fit_model(
+  fitting.function = FSH,
+  formula = Delta ~ survival::pspline(time, df = 2) * A,
+  data.set = data_set,
+  seed = seed,
+  extract.print.hr = extract_print_hr,
+  constant.HR = FALSE,
+  weights = iptw,
+  ratio = fsh_ratio
+)
+```
+
+# Model 8: IPW Case-Base Model with Time-Varying Hazard Ratio (Per-Protocol)
+```{r, cache=TRUE, warning=FALSE, message=FALSE}
+ipw_var_hr_casebase_pp <- fit_model(
+  fitting.function = FSH,
+  formula = Delta ~ survival::pspline(time, df = 2) * A,
+  data.set = data_set,
+  seed = seed,
+  extract.print.hr = extract_print_hr,
+  constant.HR = FALSE,
+  weights = combined_weights,
+  ratio = fsh_ratio
+)
+```
+
+\newpage
+# Time-Varying Hazard Ratio
+```{r, message=FALSE}
+plot_time_dep_hr(
+  list(ipw_var_hr_casebase_itt, ipw_var_hr_casebase_pp),
+  main.title = "
+    IPW Case Base: Variable Hazard Ratio (ITT vs. PP)
+  ",
+  time.grid = tau_grid,
+  casebase.var.hr = casebase_var_hr,
+  titles = c("Intention-To-Treat", "Per-Protocol"),
+  cols = colors[2:3]
+)
+```
+
+\newpage
+# Head-to-Head Comparison: Models 7 and 8
+```{r}
+plot_time_dep_hr(
+  list(
+    unadjusted_var_hr_casebase, ipw_var_hr_casebase_itt, ipw_var_hr_casebase_pp
+  ),
+  main.title = "Case Base: Variable Hazard Ratio",
+  time.grid = tau_grid,
+  casebase.var.hr = casebase_var_hr,
+  titles = c("Unadjusted","Adjusted-Intention-To-Treat", "Adjusted-Per-Protocol"),
+  cols = colors[2:4]
+)
+```
+
+\newpage
+# MS-Cox Counter-factual Survival Curves
+```{r, cache=TRUE}
+cox_csc_itt <- cox_csc(
+  model = ms_cox_itt,
+  new.data = survival_curves_data,
+  time.grid = tau_grid
 )
 
-## Initialize the plotting region for comparing the estimated causal RMST
-## contrasts over the full range of restriction times
-plot(
-  tau.grid, cox.rmst,
-  type = "n",
-  ylim = ylim,
-  xlab = expression(tau),
-  ylab = "RMST Difference",
-  main = "Causal RMST up to Tau"
+cox_csc_pp <- cox_csc(
+  model = ms_cox_pp,
+  new.data = survival_curves_data,
+  time.grid = tau_grid
+)
+```
+
+# IPW Case-Base Counter-factual Survival Curves
+```{r, cache=TRUE, message=FALSE, warning=FALSE}
+casebase_csc_itt <- casebase_csc(
+  seed = seed,
+  data.set = data_set,
+  model = ipw_var_hr_casebase_itt,
+  weights = iptw,
+  new.data = survival_curves_data,
+  time.grid = tau_grid,
+  FSH = FSH
 )
 
-# 95% Confidence Bands
+casebase_csc_pp <- casebase_csc(
+  seed = seed,
+  data.set = data_set,
+  model = ipw_var_hr_casebase_pp,
+  weights = combined_weights,
+  new.data = survival_curves_data,
+  time.grid = tau_grid,
+  FSH = FSH
+)
+```
 
-## Add the pointwise 95% confidence band for the MS-Cox RMST contrast
-polygon(
-  c(tau.grid, rev(tau.grid)),
-  c(cox.lower, rev(cox.upper)),
-  col = adjustcolor(col.cox, alpha.f = 0.2),
-  border = NA
+\newpage
+# Head-to-Head Comparison of Counter-factual Survival Curves (Intention-To-Treat)
+```{r}
+# Counter-factual Survival Curves (MS-Cox)
+plot_csc(
+  time.grid = tau_grid,
+  S0 = cox_csc_itt$S0,
+  S0.lower = cox_csc_itt$S0.lower,
+  S0.upper = cox_csc_itt$S0.upper,
+  S1 = cox_csc_itt$S1,
+  S1.lower = cox_csc_itt$S1.lower,
+  S1.upper = cox_csc_itt$S1.upper,
+  main.title = "Counter-factual Survival Curves (MS-Cox)",
+  fills = fills[2:3], cols = colors[2:3]
 )
 
-## Add the pointwise 95% confidence band for the IPW case-base RMST contrast
-polygon(
-  c(tau.grid, rev(tau.grid)),
-  c(cb.lower, rev(cb.upper)),
-  col = adjustcolor(col.cb, alpha.f = 0.2),
-  border = NA
+# Counter-factual Survival Curves (Case Base)
+plot_csc(
+  time.grid = tau_grid,
+  S0 = casebase_csc_itt$S0,
+  S0.lower = casebase_csc_itt$S0.lower,
+  S0.upper = casebase_csc_itt$S0.upper,
+  S1 = casebase_csc_itt$S1,
+  S1.lower = casebase_csc_itt$S1.lower,
+  S1.upper = casebase_csc_itt$S1.upper,
+  main.title = "Counter-factual Survival Curves (Case Base)",
+  fills = fills[2:3], cols = colors[2:3]
+)
+```
+
+\newpage
+# Head-to-Head Comparison of Counter-factual Survival Curves (Per-Protocol)
+```{r}
+# Counter-factual Survival Curves (MS-Cox)
+plot_csc(
+  time.grid = tau_grid,
+  S0 = cox_csc_pp$S0,
+  S0.lower = cox_csc_pp$S0.lower,
+  S0.upper = cox_csc_pp$S0.upper,
+  S1 = cox_csc_pp$S1,
+  S1.lower = cox_csc_pp$S1.lower,
+  S1.upper = cox_csc_pp$S1.upper,
+  main.title = "Counter-factual Survival Curves (MS-Cox)",
+  fills = fills[2:3], cols = colors[2:3]
 )
 
-# RMST Contrast Estimates
+# Counter-factual Survival Curves (Case Base)
+plot_csc(
+  time.grid = tau_grid,
+  S0 = casebase_csc_pp$S0,
+  S0.lower = casebase_csc_pp$S0.lower,
+  S0.upper = casebase_csc_pp$S0.upper,
+  S1 = casebase_csc_pp$S1,
+  S1.lower = casebase_csc_pp$S1.lower,
+  S1.upper = casebase_csc_pp$S1.upper,
+  main.title = "Counter-factual Survival Curves (Case Base)",
+  fills = fills[2:3], cols = colors[2:3]
+)
+```
 
-## Overlay the estimated causal RMST contrast from the MS-Cox model
-lines(tau.grid, cox.rmst, col = col.cox, lwd = 2)
+\newpage
+# RMST Estimates and Standard Errors
+```{r, cache=TRUE}
+rmst_stats_itt <- rmst_stats(
+  models.list = list(
+    cox = ms_cox_itt,
+    casebase = ipw_var_hr_casebase_itt
+  ),
+  time.grid = tau_grid,
+  new.data = survival_curves_data,
+  cox.rmst.list = cox_rmst_list,
+  casebase.rmst.list = casebase_rmst_list,
+  rmst.calculation = rmst_calculation,
+  rmst.diff = rmst_diff,
+  casebase.surv = casebase_surv
+)
+```
 
-## Overlay the estimated causal RMST contrast from the IPW case-base model
-lines(tau.grid, cb.rmst, col = col.cb, lwd = 2)
+```{r}
+rmst_stats_pp <- rmst_stats(
+  models.list = list(
+    cox = ms_cox_pp,
+    casebase = ipw_var_hr_casebase_pp
+  ),
+  time.grid = tau_grid,
+  new.data = survival_curves_data,
+  cox.rmst.list = cox_rmst_list,
+  casebase.rmst.list = casebase_rmst_list,
+  rmst.calculation = rmst_calculation,
+  rmst.diff = rmst_diff,
+  casebase.surv = casebase_surv
+)
+```
 
-## Add a reference line at an RMST difference of zero, corresponding to equal
-## restricted mean survival under the two treatment conditions
-abline(h = 0, lty = 3)
+\newpage
+# RMST Comparison Plots
+```{r}
+plot_rmst_comparison(
+  rmst.stats = rmst_stats_itt,
+  fills = fills[2:3], cols = colors[2:3],
+  additional.title = "(Intention-To-Treat)"
+)
 
-# Model Legend
-
-## Identify the two estimation approaches in the comparison plot
-legend(
-  "bottomleft",
-  legend = c("MS-Cox", "IPW Case-Base"),
-  col = c(col.cox, col.cb),
-  lwd = 2,
-  bty = "n"
+plot_rmst_comparison(
+  rmst.stats = rmst_stats_pp,
+  fills = fills[2:3], cols = colors[2:3],
+  additional.title = "(Per-Protocol)"
 )
 ```

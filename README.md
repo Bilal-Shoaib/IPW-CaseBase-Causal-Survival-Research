@@ -30,13 +30,12 @@ The real-world application further demonstrates the flexibility of the proposed 
 
 # Repository Structure
 
-The repository is organized into three primary directories:
+The repository is organized into two primary directories:
 
 ```text
 .
 ├── Application/
 ├── Simulation Study/
-└── Data Sets/
 ```
 
 Each directory serves a distinct purpose within the research project.
@@ -53,7 +52,6 @@ Application/
 └── RHC/
     ├── Final/
     │   ├── Rmd-Files/
-    │   ├── R-Files/
     │   ├── Misc/
     │   └── Plots and Diagrams/
     └── Other versions/
@@ -74,14 +72,6 @@ Contains the finalized version of the RHC analysis and all associated computatio
 ##### `Rmd-Files/`
 
 Contains the complete `.Rmd` file in which all code used for the final RHC analysis is combined into a single document.
-
-This provides the full analysis as a single, sequential workflow.
-
-##### `R-Files/`
-
-Contains the same code used in the `.Rmd` file, separated into multiple `.R` scripts according to their respective analytical tasks.
-
-This version is provided to improve organization, readability, and ease of navigation through the analysis.
 
 ##### `Misc/`
 
@@ -106,7 +96,6 @@ The directory follows the same organizational structure used for the finalized a
 ```text
 Simulation Study/
 ├── Rmd-Files/
-├── R-Files/
 ├── Misc/
 └── Plots and Diagrams/
 ```
@@ -115,12 +104,6 @@ Simulation Study/
 
 Contains the complete `.Rmd` file containing the simulation study in its entirety, including the simulation setup, data generation, model fitting, performance evaluation, and results.
 
-### `R-Files/`
-
-Contains the same simulation code divided into separate `.R` files according to their respective analytical components.
-
-The segmented scripts provide a more organized representation of the simulation workflow and facilitate inspection of individual components.
-
 ### `Misc/`
 
 Contains miscellaneous supporting materials associated with the simulation study.
@@ -128,14 +111,6 @@ Contains miscellaneous supporting materials associated with the simulation study
 ### `Plots and Diagrams/`
 
 Contains plots, figures, and diagrams generated from the simulation study.
-
----
-
-## 3. Data Sets
-
-The `Data Sets` directory contains additional datasets that were considered during the development of the research project.
-
-These datasets are not required to reproduce either the Application or the Simulation Study. They are retained as supplementary materials documenting datasets that were initially considered during the development of the project.
 
 ---
 
