@@ -1,0 +1,740 @@
+---
+title: "Causal RMST under case-base sampling with IPW: simulation study"
+author: "Bilal Shaikh and Sumeet Kalia"
+output: pdf_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = FALSE, warning = FALSE, message = FALSE)
+```
+
+# Libraries
+
+```{r}
+library("survival")
+library("casebase")
+library("sandwich")
+library("splines")
+library("foreach")
+library("doParallel")
+library("doRNG")
+library("ggplot2")
+library("grid")
+library("xtable")
+```
+
+# Global configuration
+
+```{r}
+SEED <- 20260811
+N_REPLICATES <- 2000
+N_REFERENCE <- 1e7
+CB_RATIO <- 20
+NU <- 1
+TAU_GRID <- seq(0, 3, by = 0.02)
+TAU_REPORT <- c(0.5, 1, 2, 3)
+N_CORES <- max(1, parallel::detectCores() - 1)
+ALPHA <- 0.05
+Z_CRIT <- qnorm(1 - ALPHA / 2)
+
+GAMMA_RAW <- c(0.7, -0.4, 0.5, 0.2, 0.6, -0.3, 0.1, -0.2, 0.4, -0.5)
+BETA_RAW <- c(0.6, -0.3, 0.4, 0.1, 0.5, -0.2, 0.3, -0.1, 0.4, -0.4)
+
+GAMMA_VEC <- GAMMA_RAW / sqrt(sum(GAMMA_RAW^2))
+BETA_VEC <- BETA_RAW / sqrt(sum(BETA_RAW^2))
+
+SCENARIOS <- data.frame(
+  scenario = paste0("S", 1:8),
+  label = c("Null treatment effect", "Moderate treatment effect",
+            "Reference configuration", "Reduced sample size",
+            "Small sample size", "Heavy censoring",
+            "Strong confounding", "Weak prognostic covariate effect"),
+  beta.a = c(0, log(1.5), log(2), log(2), log(2), log(2), log(2), log(2)),
+  n = c(1000, 1000, 1000, 500, 250, 1000, 1000, 1000),
+  c.max = c(3.0, 3.0, 3.0, 3.0, 3.0, 1.5, 3.0, 3.0),
+  c.gamma = c(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 1.0),
+  c.beta = c(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5),
+  stringsAsFactors = FALSE
+)
+
+SCENARIOS
+```
+
+# Data-generating mechanism
+
+Covariates are standardized to zero mean and unit variance so that `c.gamma` is
+the standard deviation of the treatment linear predictor and `c.beta` scales the
+prognostic index.
+
+```{r}
+standardize <- function(x, mu, sigma) (x - mu) / sigma
+
+draw_covariates <- function(n) {
+  x1 <- rnorm(n)
+  x2 <- rnorm(n)
+  x3 <- standardize(runif(n), 0.5, sqrt(1 / 12))
+  x4 <- standardize(runif(n), 0.5, sqrt(1 / 12))
+  m5 <- exp(0.125)
+  s5 <- sqrt((exp(0.25) - 1) * exp(0.25))
+  x5 <- standardize(rlnorm(n, meanlog = 0, sdlog = 0.5), m5, s5)
+  x6 <- standardize(rgamma(n, shape = 2, rate = 1), 2, sqrt(2))
+  x7 <- standardize(rexp(n, rate = 1), 1, 1)
+  x8 <- standardize(rbinom(n, 1, 0.5), 0.5, sqrt(0.25))
+  x9 <- standardize(rbinom(n, 1, 0.3), 0.3, sqrt(0.21))
+  x10 <- standardize(rpois(n, lambda = 1.5), 1.5, sqrt(1.5))
+  cbind(X1 = x1, X2 = x2, X3 = x3, X4 = x4, X5 = x5,
+        X6 = x6, X7 = x7, X8 = x8, X9 = x9, X10 = x10)
+}
+
+generate_data <- function(n, beta.a, c.max, c.gamma, c.beta) {
+  x.mat <- draw_covariates(n)
+  lp.a <- c.gamma * as.vector(x.mat %*% GAMMA_VEC)
+  e.score <- plogis(lp.a)
+  a.vec <- rbinom(n, 1, e.score)
+  lp.y <- c.beta * as.vector(x.mat %*% BETA_VEC) + beta.a * a.vec
+  u.unif <- runif(n)
+  t.event <- (-log(u.unif) / exp(lp.y))^(1 / NU)
+  t.cens <- runif(n, 0, c.max)
+  data.frame(time = pmin(t.event, t.cens),
+             status = as.integer(t.event <= t.cens),
+             A = a.vec,
+             x.mat)
+}
+```
+
+# Reference values
+
+The counterfactual survival function is a covariate mixture and is evaluated by
+Monte Carlo integration over the covariate distribution alone. No event times,
+no censoring and no working model enter this computation.
+
+```{r}
+rmst_from_survival <- function(t.grid, s.vec) {
+  d.t <- diff(t.grid)
+  mids <- (head(s.vec, -1) + tail(s.vec, -1)) / 2
+  c(0, cumsum(mids * d.t))
+}
+
+reference_values <- function(beta.a, c.beta, n.ref = N_REFERENCE, chunk = 1e5) {
+  n.done <- 0
+  next.report <- 0.1
+  s0.sum <- rep(0, length(TAU_GRID))
+  s1.sum <- rep(0, length(TAU_GRID))
+  h0.num <- rep(0, length(TAU_GRID))
+  h1.num <- rep(0, length(TAU_GRID))
+  while (n.done < n.ref) {
+    m <- min(chunk, n.ref - n.done)
+    x.mat <- draw_covariates(m)
+    eta <- c.beta * as.vector(x.mat %*% BETA_VEC)
+    base.haz <- outer(TAU_GRID^NU, rep(1, m))
+    lam0 <- exp(eta)
+    lam1 <- exp(eta + beta.a)
+    s0.mat <- exp(-base.haz * rep(lam0, each = length(TAU_GRID)))
+    s1.mat <- exp(-base.haz * rep(lam1, each = length(TAU_GRID)))
+    s0.sum <- s0.sum + rowSums(s0.mat)
+    s1.sum <- s1.sum + rowSums(s1.mat)
+    h0.num <- h0.num + rowSums(s0.mat * rep(lam0, each = length(TAU_GRID)))
+    h1.num <- h1.num + rowSums(s1.mat * rep(lam1, each = length(TAU_GRID)))
+    n.done <- n.done + m
+    if (n.done / n.ref >= next.report) {
+      cat(sprintf("  reference integration: %3.0f%%\n", 100 * n.done / n.ref))
+      flush.console()
+      next.report <- next.report + 0.1
+    }
+  }
+  s0 <- s0.sum / n.ref
+  s1 <- s1.sum / n.ref
+  haz0 <- NU * TAU_GRID^(NU - 1) * (h0.num / n.ref) / pmax(s0, .Machine$double.eps)
+  haz1 <- NU * TAU_GRID^(NU - 1) * (h1.num / n.ref) / pmax(s1, .Machine$double.eps)
+  list(t.grid = TAU_GRID,
+       s0 = s0,
+       s1 = s1,
+       rmst.diff = rmst_from_survival(TAU_GRID, s1) - rmst_from_survival(TAU_GRID, s0),
+       hr.t = haz1 / haz0)
+}
+```
+
+The constant-effect estimators are additionally compared against the large-sample
+limit of the corresponding fitting criterion under an exogenous-treatment version
+of the same mechanism. This limit is a projection attached to the criterion and
+not a structural parameter.
+
+```{r}
+PROJ_N <- 5e5
+PROJ_RATIO <- 5
+proj.cache <- new.env(parent = emptyenv())
+
+projection_limits <- function(beta.a, c.beta, c.max) {
+  key <- paste(beta.a, c.beta, c.max, sep = "_")
+  if (!is.null(proj.cache[[key]])) return(proj.cache[[key]])
+  set.seed(SEED + 991)
+  d.proj <- generate_data(PROJ_N, beta.a, c.max, c.gamma = 0, c.beta = c.beta)
+  w.unit <- rep(1, nrow(d.proj))
+  cox.fit <- coxph(Surv(time, status) ~ A, data = d.proj)
+  cb.fit <- fit_casebase(d.proj, w.unit, basis = "spline", ratio = PROJ_RATIO)
+  cox.ref <- cox_rmst(cox.fit)
+  out <- list(
+    psi = c(cox = unname(coef(cox.fit)["A"]),
+            casebase = unname(coef(cb.fit$fit)["A"])),
+    rmst.cox = cox.ref$rmst
+  )
+  proj.cache[[key]] <- out
+  out
+}
+```
+
+# Weighted case-base fitting
+
+`sampleCaseBase` draws base moments proportionally to observed follow-up time.
+Observation weights are attached before sampling so that each sampled moment
+inherits the weight of the individual from which it was drawn, which makes the
+weighted score equation target the weighted hazard.
+
+```{r}
+interior_knots <- function(event.times, bnd, probs = c(0.25, 0.5, 0.75)) {
+  if (length(event.times) < 20) return(numeric(0))
+  k <- unique(as.numeric(quantile(event.times, probs = probs, names = FALSE)))
+  k <- k[k > bnd[1] + .Machine$double.eps & k < bnd[2] - .Machine$double.eps]
+  sort(unique(k))
+}
+
+fit_casebase <- function(data.set, weights, basis = c("spline", "gompertz", "exponential"),
+                         time.varying = FALSE, ratio = CB_RATIO, seed = NULL) {
+  basis <- match.arg(basis)
+  d.aug <- data.set
+  d.aug$w <- weights
+  if (!is.null(seed)) set.seed(seed)
+  cb.data <- sampleCaseBase(d.aug, time = "time", event = "status", ratio = ratio)
+  bnd <- range(cb.data$time)
+  knot.q <- interior_knots(data.set$time[data.set$status == 1], bnd)
+  time.term <- switch(
+    basis,
+    exponential = NULL,
+    gompertz = "time",
+    spline = if (length(knot.q) > 0) {
+      sprintf("bs(time, knots = c(%s), Boundary.knots = c(%s), degree = 3)",
+              paste(knot.q, collapse = ", "), paste(bnd, collapse = ", "))
+    } else {
+      sprintf("bs(time, df = 3, Boundary.knots = c(%s), degree = 3)",
+              paste(bnd, collapse = ", "))
+    }
+  )
+  rhs <- if (is.null(time.term)) {
+    "A"
+  } else if (time.varying) {
+    paste0("A * ", time.term)
+  } else {
+    paste0("A + ", time.term)
+  }
+  form <- as.formula(paste("status ~", rhs, "+ offset(offset)"))
+  fit <- glm(form, data = cb.data, family = binomial, weights = w)
+  list(fit = fit,
+       vcov = vcovHC(fit, type = "HC0"),
+       knots = knot.q,
+       bnd = bnd,
+       basis = basis,
+       time.varying = time.varying)
+}
+
+casebase_hazard_grid <- function(cb.obj, a.value, t.grid) {
+  nd <- data.frame(time = pmax(t.grid, .Machine$double.eps), A = a.value, offset = 0)
+  x.grid <- model.matrix(delete.response(terms(cb.obj$fit)), data = nd)
+  x.grid <- x.grid[, names(coef(cb.obj$fit)), drop = FALSE]
+  list(x = x.grid, hazard = as.vector(exp(x.grid %*% coef(cb.obj$fit))))
+}
+```
+
+# RMST contrast and delta-method standard error
+
+For the case-base model the gradient is available in closed form. Writing
+$\lambda^{(a)}(u) = \exp\{z(u,a)^\top\beta\}$, the gradient of the survival
+function is $-S^{(a)}(t)\int_0^t \lambda^{(a)}(u) z(u,a)\,du$, and the RMST
+gradient integrates this over the horizon.
+
+```{r}
+casebase_rmst <- function(cb.obj, t.grid = TAU_GRID) {
+  d.t <- diff(t.grid)
+  grad.list <- list()
+  surv.list <- list()
+  for (a.value in c(0, 1)) {
+    g <- casebase_hazard_grid(cb.obj, a.value, t.grid)
+    lam <- g$hazard
+    cum.haz <- c(0, cumsum(d.t * (head(lam, -1) + tail(lam, -1)) / 2))
+    s.vec <- exp(-cum.haz)
+    lam.x <- g$x * lam
+    d.cum <- rbind(0, apply(lam.x, 2, function(col) {
+      cumsum(d.t * (head(col, -1) + tail(col, -1)) / 2)
+    }))
+    d.surv <- -s.vec * d.cum
+    d.rmst <- rbind(0, apply(d.surv, 2, function(col) {
+      cumsum(d.t * (head(col, -1) + tail(col, -1)) / 2)
+    }))
+    surv.list[[as.character(a.value)]] <- s.vec
+    grad.list[[as.character(a.value)]] <- d.rmst
+  }
+  rmst.diff <- rmst_from_survival(t.grid, surv.list[["1"]]) -
+    rmst_from_survival(t.grid, surv.list[["0"]])
+  grad.diff <- grad.list[["1"]] - grad.list[["0"]]
+  v.mat <- cb.obj$vcov[colnames(grad.diff), colnames(grad.diff), drop = FALSE]
+  se.vec <- sqrt(pmax(rowSums((grad.diff %*% v.mat) * grad.diff), 0))
+  list(t.grid = t.grid, s0 = surv.list[["0"]], s1 = surv.list[["1"]],
+       rmst = rmst.diff, se = se.vec)
+}
+```
+
+For the marginal structural Cox model the baseline is held fixed and only the
+treatment coefficient contributes, which gives
+$\partial S^{(1)}/\partial\psi = S^{(1)}(t)\log S^{(1)}(t)$.
+
+```{r}
+cox_rmst <- function(cox.fit, t.grid = TAU_GRID) {
+  sf <- survfit(cox.fit, newdata = data.frame(A = c(0, 1)))
+  s0 <- approx(sf$time, sf$surv[, 1], t.grid, method = "constant", rule = 2)$y
+  s1 <- approx(sf$time, sf$surv[, 2], t.grid, method = "constant", rule = 2)$y
+  se.psi <- sqrt(diag(vcov(cox.fit))["A"])
+  integrand <- ifelse(s1 > 0, s1 * log(pmax(s1, .Machine$double.eps)), 0)
+  g.vec <- rmst_from_survival(t.grid, integrand)
+  list(t.grid = t.grid, s0 = s0, s1 = s1,
+       rmst = rmst_from_survival(t.grid, s1) - rmst_from_survival(t.grid, s0),
+       se = abs(g.vec) * as.numeric(se.psi))
+}
+```
+
+# One replicate
+
+```{r}
+run_replicate <- function(n, beta.a, c.max, c.gamma, c.beta) {
+  d.set <- generate_data(n, beta.a, c.max, c.gamma, c.beta)
+  ps.fit <- glm(A ~ X1 + X2 + X3 + X4 + X5 + X6 + X7 + X8 + X9 + X10,
+                data = d.set, family = binomial)
+  p.score <- pmin(pmax(fitted(ps.fit), 1e-8), 1 - 1e-8)
+  p.marg <- mean(d.set$A)
+  ipw <- ifelse(d.set$A == 1, p.marg / p.score, (1 - p.marg) / (1 - p.score))
+
+  out <- list(ipw.max = max(ipw),
+              ipw.mean = mean(ipw),
+              ess = sum(ipw)^2 / sum(ipw^2) / n,
+              event.rate = mean(d.set$status))
+
+  m1 <- try(coxph(Surv(time, status) ~ A, data = d.set,
+                  weights = ipw, robust = TRUE), silent = TRUE)
+  if (!inherits(m1, "try-error")) {
+    r1 <- cox_rmst(m1)
+    out$M1.psi <- unname(coef(m1)["A"])
+    out$M1.se <- unname(sqrt(diag(vcov(m1))["A"]))
+    out$M1.rmst <- r1$rmst
+    out$M1.rmst.se <- r1$se
+  }
+
+  for (spec in c("M2", "M3", "M4")) {
+    basis <- switch(spec, M2 = "exponential", M3 = "gompertz", M4 = "spline")
+    cb <- try(fit_casebase(d.set, ipw, basis = basis), silent = TRUE)
+    if (!inherits(cb, "try-error") && cb$fit$converged) {
+      rr <- casebase_rmst(cb)
+      out[[paste0(spec, ".psi")]] <- unname(coef(cb$fit)["A"])
+      out[[paste0(spec, ".se")]] <- unname(sqrt(diag(cb$vcov)["A"]))
+      out[[paste0(spec, ".rmst")]] <- rr$rmst
+      out[[paste0(spec, ".rmst.se")]] <- rr$se
+    }
+  }
+
+  m5 <- try(coxph(Surv(time, status) ~ A + tt(A), data = d.set,
+                  weights = ipw, robust = TRUE,
+                  tt = function(x, t, ...) x * log(pmax(t, 1e-8))), silent = TRUE)
+  if (!inherits(m5, "try-error")) {
+    b5 <- coef(m5)
+    v5 <- vcov(m5)
+    log.t <- log(pmax(TAU_GRID, 1e-8))
+    out$M5.loghr <- b5[1] + b5[2] * log.t
+    out$M5.loghr.se <- sqrt(v5[1, 1] + log.t^2 * v5[2, 2] + 2 * log.t * v5[1, 2])
+  }
+
+  m6 <- try(fit_casebase(d.set, ipw, basis = "spline", time.varying = TRUE),
+            silent = TRUE)
+  if (!inherits(m6, "try-error") && m6$fit$converged) {
+    g1 <- casebase_hazard_grid(m6, 1, TAU_GRID)$x
+    g0 <- casebase_hazard_grid(m6, 0, TAU_GRID)$x
+    d.x <- g1 - g0
+    out$M6.loghr <- as.vector(d.x %*% coef(m6$fit))
+    out$M6.loghr.se <- sqrt(pmax(rowSums((d.x %*% m6$vcov) * d.x), 0))
+  }
+
+  out
+}
+```
+
+# Running the study
+
+```{r}
+dir.create("Figures/Simulation", recursive = TRUE, showWarnings = FALSE)
+
+cl <- makeCluster(N_CORES)
+registerDoParallel(cl)
+registerDoRNG(SEED)
+
+results.all <- list()
+
+for (s.index in seq_len(nrow(SCENARIOS))) {
+  s.row <- SCENARIOS[s.index, ]
+  cat(sprintf("\n===== Scenario %s: %s =====\n", s.row$scenario, s.row$label))
+  cat("computing reference values\n")
+  ref <- reference_values(s.row$beta.a, s.row$c.beta)
+  proj <- projection_limits(s.row$beta.a, s.row$c.beta, s.row$c.max)
+
+  chunk.size <- ceiling(N_REPLICATES / 20)
+  chunk.start <- seq(1, N_REPLICATES, by = chunk.size)
+  reps <- list()
+  for (k in seq_along(chunk.start)) {
+    n.this <- min(chunk.size, N_REPLICATES - chunk.start[k] + 1)
+    reps[[k]] <- foreach(
+      i = seq_len(n.this),
+      .packages = c("survival", "casebase", "sandwich", "splines"),
+      .export = c("generate_data", "draw_covariates", "standardize",
+                  "fit_casebase", "casebase_hazard_grid", "casebase_rmst",
+                  "cox_rmst", "rmst_from_survival", "run_replicate",
+                  "interior_knots", "GAMMA_VEC", "BETA_VEC", "NU",
+                  "TAU_GRID", "CB_RATIO"),
+      .errorhandling = "pass"
+    ) %dopar% {
+      run_replicate(s.row$n, s.row$beta.a, s.row$c.max, s.row$c.gamma, s.row$c.beta)
+    }
+    cat(sprintf("  %s: %3.0f%% complete\n", s.row$scenario,
+                100 * min(chunk.start[k] + n.this - 1, N_REPLICATES) / N_REPLICATES))
+    flush.console()
+  }
+  results.all[[s.row$scenario]] <- list(
+    scenario = s.row,
+    reference = ref,
+    projection = proj,
+    replicates = do.call(c, reps)
+  )
+}
+
+stopCluster(cl)
+saveRDS(results.all, file = "simulation-results.rds")
+```
+
+# Performance measures
+
+```{r}
+summarize_scalar <- function(est, se, truth) {
+  ok <- is.finite(est) & is.finite(se)
+  est <- est[ok]
+  se <- se[ok]
+  r <- length(est)
+  bias <- mean(est) - truth
+  mcsd <- sd(est)
+  lower <- est - Z_CRIT * se
+  upper <- est + Z_CRIT * se
+  data.frame(
+    n.used = r,
+    truth = truth,
+    mean.est = mean(est),
+    bias = bias,
+    bias.mcse = mcsd / sqrt(r),
+    mcsd = mcsd,
+    ase = mean(se),
+    mse = mean((est - truth)^2),
+    coverage = mean(lower <= truth & truth <= upper),
+    coverage.mcse = sqrt(mean(lower <= truth & truth <= upper) *
+                           (1 - mean(lower <= truth & truth <= upper)) / r),
+    reject = mean(abs(est / se) > Z_CRIT)
+  )
+}
+
+extract_grid <- function(reps, field, index) {
+  vapply(reps, function(z) {
+    v <- z[[field]]
+    if (is.null(v) || length(v) < index) NA_real_ else v[index]
+  }, numeric(1))
+}
+
+tau.index <- match(TAU_REPORT, TAU_GRID)
+
+rmst.summary <- do.call(rbind, lapply(names(results.all), function(s.name) {
+  obj <- results.all[[s.name]]
+  reps <- Filter(function(z) is.list(z) && !inherits(z, "error"), obj$replicates)
+  do.call(rbind, lapply(c("M1", "M2", "M3", "M4"), function(m) {
+    do.call(rbind, lapply(seq_along(TAU_REPORT), function(j) {
+      idx <- tau.index[j]
+      est <- extract_grid(reps, paste0(m, ".rmst"), idx)
+      se <- extract_grid(reps, paste0(m, ".rmst.se"), idx)
+      cbind(data.frame(scenario = s.name, method = m, tau = TAU_REPORT[j]),
+            summarize_scalar(est, se, obj$reference$rmst.diff[idx]))
+    }))
+  }))
+}))
+
+hr.summary <- do.call(rbind, lapply(names(results.all), function(s.name) {
+  obj <- results.all[[s.name]]
+  reps <- Filter(function(z) is.list(z) && !inherits(z, "error"), obj$replicates)
+  do.call(rbind, lapply(c("M1", "M2", "M3", "M4"), function(m) {
+    est <- vapply(reps, function(z) {
+      v <- z[[paste0(m, ".psi")]]; if (is.null(v)) NA_real_ else v
+    }, numeric(1))
+    se <- vapply(reps, function(z) {
+      v <- z[[paste0(m, ".se")]]; if (is.null(v)) NA_real_ else v
+    }, numeric(1))
+    pj <- if (is.list(obj$projection)) obj$projection$psi else obj$projection
+    truth <- if (m == "M1") pj["cox"] else pj["casebase"]
+    cbind(data.frame(scenario = s.name, method = m), summarize_scalar(est, se, truth))
+  }))
+}))
+
+convergence.summary <- do.call(rbind, lapply(names(results.all), function(s.name) {
+  reps <- results.all[[s.name]]$replicates
+  errors <- sum(vapply(reps, function(z) inherits(z, "error"), logical(1)))
+  ok <- Filter(function(z) is.list(z) && !inherits(z, "error"), reps)
+  data.frame(
+    scenario = s.name,
+    replicates = length(reps),
+    hard.failures = errors,
+    M1.missing = sum(vapply(ok, function(z) is.null(z$M1.psi), logical(1))),
+    M2.missing = sum(vapply(ok, function(z) is.null(z$M2.psi), logical(1))),
+    M3.missing = sum(vapply(ok, function(z) is.null(z$M3.psi), logical(1))),
+    M4.missing = sum(vapply(ok, function(z) is.null(z$M4.psi), logical(1))),
+    mean.ipw = mean(vapply(ok, function(z) z$ipw.mean, numeric(1))),
+    max.ipw = max(vapply(ok, function(z) z$ipw.max, numeric(1))),
+    ess = mean(vapply(ok, function(z) z$ess, numeric(1))),
+    event.rate = mean(vapply(ok, function(z) z$event.rate, numeric(1)))
+  )
+}))
+
+rmst.summary
+hr.summary
+convergence.summary
+```
+
+# LaTeX tables
+
+```{r}
+print(xtable(rmst.summary[, c("scenario", "method", "tau", "truth", "mean.est",
+                              "bias", "mcsd", "ase", "mse", "coverage")],
+             digits = c(0, 0, 0, 2, 4, 4, 4, 4, 4, 4, 3)),
+      include.rownames = FALSE, file = "table-sim-rmst.tex")
+
+print(xtable(hr.summary[, c("scenario", "method", "truth", "mean.est", "bias",
+                            "mcsd", "ase", "mse", "coverage", "reject")],
+             digits = c(0, 0, 0, 4, 4, 4, 4, 4, 4, 3, 3)),
+      include.rownames = FALSE, file = "table-sim-hr.tex")
+
+print(xtable(convergence.summary, digits = c(0, 0, 0, 0, 0, 0, 0, 0, 3, 2, 3, 3)),
+      include.rownames = FALSE, file = "table-sim-convergence.tex")
+```
+
+# Reference values: integration against a model-based alternative
+
+This section quantifies what is lost by defining the reference value through a
+fitted working model instead of by direct integration. It does not depend on the
+replicates, only on the data-generating mechanism, so it can be run on its own
+and is unaffected by objects left over from an earlier run.
+
+```{r}
+ref.cache <- new.env(parent = emptyenv())
+
+cox_reference_rmst <- function(beta.a, c.beta, c.max, n.proj = PROJ_N) {
+  key <- paste(beta.a, c.beta, c.max, sep = "_")
+  if (!is.null(ref.cache[[key]])) return(ref.cache[[key]])
+  set.seed(SEED + 991)
+  d.proj <- generate_data(n.proj, beta.a, c.max, c.gamma = 0, c.beta = c.beta)
+  cox.fit <- coxph(Surv(time, status) ~ A, data = d.proj)
+  out <- cox_rmst(cox.fit)$rmst
+  ref.cache[[key]] <- out
+  out
+}
+
+integration_reference <- function(s.name, beta.a, c.beta) {
+  obj <- if (exists("results.all")) results.all[[s.name]] else NULL
+  if (!is.null(obj) && is.list(obj$reference)) return(obj$reference$rmst.diff)
+  reference_values(beta.a, c.beta)$rmst.diff
+}
+
+reference.compare <- do.call(rbind, lapply(seq_len(nrow(SCENARIOS)), function(k) {
+  s.row <- SCENARIOS[k, ]
+  cat(sprintf("reference comparison: %s\n", s.row$scenario))
+  flush.console()
+  exact.curve <- integration_reference(s.row$scenario, s.row$beta.a, s.row$c.beta)
+  model.curve <- cox_reference_rmst(s.row$beta.a, s.row$c.beta, s.row$c.max)
+  do.call(rbind, lapply(c(1, 3), function(tau) {
+    idx <- match(tau, TAU_GRID)
+    exact <- exact.curve[idx]
+    modelled <- model.curve[idx]
+    data.frame(scenario = s.row$scenario, tau = tau,
+               integration = exact, cox.working = modelled,
+               difference = modelled - exact,
+               pct.of.truth = ifelse(abs(exact) < 1e-10, NA_real_,
+                                     100 * (modelled - exact) / abs(exact)))
+  }))
+}))
+reference.compare
+
+print(xtable(reference.compare, digits = c(0, 0, 0, 4, 4, 4, 1)),
+      include.rownames = FALSE, file = "table-sim-reference.tex")
+```
+
+# Figures
+
+```{r}
+PAL <- c("red", "blue", "green4", "black")
+LTY <- c("solid", "dashed", "dotdash", "dotted")
+SHP <- c(16, 17, 15, 3)
+
+theme_pub <- function(base_size = 10) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(colour = "grey90", linewidth = 0.3),
+      panel.border = element_rect(colour = "grey30", fill = NA, linewidth = 0.4),
+      strip.background = element_blank(),
+      strip.text = element_text(face = "bold", size = base_size),
+      axis.text = element_text(colour = "grey20"),
+      legend.position = "bottom",
+      legend.direction = "horizontal",
+      legend.title = element_blank(),
+      legend.key.width = unit(1.4, "lines")
+    )
+}
+
+ref.s3 <- results.all[["S3"]]$reference
+reps.s3 <- Filter(function(z) is.list(z) && !inherits(z, "error"),
+                  results.all[["S3"]]$replicates)
+
+rmst.curve <- do.call(rbind, lapply(c("M1", "M3", "M4"), function(m) {
+  mat <- do.call(rbind, lapply(reps.s3, function(z) z[[paste0(m, ".rmst")]]))
+  data.frame(time = TAU_GRID, estimate = colMeans(mat, na.rm = TRUE), method = m)
+}))
+rmst.curve <- rbind(data.frame(time = TAU_GRID, estimate = ref.s3$rmst.diff,
+                               method = "Truth"),
+                    rmst.curve)
+rmst.curve$method <- factor(rmst.curve$method, levels = c("Truth", "M1", "M3", "M4"))
+
+ggplot(rmst.curve, aes(x = time, y = estimate, colour = method,
+                       linetype = method)) +
+  geom_line(linewidth = 0.6) +
+  scale_colour_manual(values = c("black", PAL[1:3])) +
+  scale_linetype_manual(values = c("solid", LTY[2:4])) +
+  labs(x = "Restriction horizon", y = "RMST contrast") +
+  theme_pub() +
+  guides(colour = guide_legend(nrow = 1), linetype = guide_legend(nrow = 1))
+ggsave("Figures/Simulation/rmst-curves.pdf", width = 7, height = 4.4)
+
+hr.curve <- rbind(
+  data.frame(time = TAU_GRID, hr = ref.s3$hr.t, method = "Truth"),
+  data.frame(time = TAU_GRID, method = "MS-Cox (M5)",
+             hr = exp(colMeans(do.call(rbind, lapply(reps.s3, function(z) z$M5.loghr)),
+                               na.rm = TRUE))),
+  data.frame(time = TAU_GRID, method = "Case-base (M6)",
+             hr = exp(colMeans(do.call(rbind, lapply(reps.s3, function(z) z$M6.loghr)),
+                               na.rm = TRUE)))
+)
+hr.curve$method <- factor(hr.curve$method,
+                          levels = c("Truth", "MS-Cox (M5)", "Case-base (M6)"))
+
+ggplot(subset(hr.curve, time > 0), aes(x = time, y = hr, colour = method,
+                                       linetype = method)) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey40") +
+  geom_line(linewidth = 0.6) +
+  scale_colour_manual(values = c("black", PAL[1:2])) +
+  scale_linetype_manual(values = c("solid", LTY[2:3])) +
+  coord_cartesian(ylim = c(0.5, 3)) +
+  labs(x = "Time", y = "Marginal hazard ratio") +
+  theme_pub() +
+  guides(colour = guide_legend(nrow = 1), linetype = guide_legend(nrow = 1))
+ggsave("Figures/Simulation/hazard-ratio-time.pdf", width = 7, height = 4.4)
+
+cov.frame <- subset(rmst.summary, method %in% c("M1", "M2", "M3", "M4"))
+cov.frame$scenario <- factor(cov.frame$scenario, levels = paste0("S", 1:8))
+
+ggplot(cov.frame, aes(x = factor(tau), y = coverage, colour = method,
+                      shape = method, group = method)) +
+  geom_hline(yintercept = 0.95, linetype = "dashed", colour = "grey40") +
+  geom_line(linewidth = 0.4) +
+  geom_point(size = 1.9) +
+  facet_wrap(~ scenario, nrow = 2) +
+  scale_colour_manual(values = PAL) +
+  scale_shape_manual(values = SHP) +
+  scale_y_continuous(limits = c(0.7, 1), breaks = seq(0.7, 1, by = 0.05)) +
+  labs(x = "Restriction horizon", y = "Empirical coverage") +
+  theme_pub() +
+  guides(colour = guide_legend(nrow = 1), shape = guide_legend(nrow = 1))
+ggsave("Figures/Simulation/coverage.pdf", width = 10, height = 5)
+```
+
+# Computation time
+
+The benchmark below is independent of the main study and can be run on its own.
+It times a single fit of each estimator at three sample sizes, repeated
+`BENCH_REPS` times on one core, and writes the timing table used in the
+appendix. Timings are wall-clock seconds per fit and exclude the construction of
+the weights, which is common to all six estimators.
+
+```{r}
+BENCH_REPS <- 25
+BENCH_N <- c(500, 1000, 2000)
+
+time_once <- function(expr) {
+  as.numeric(system.time(expr)["elapsed"])
+}
+
+benchmark_fits <- function(n, beta.a = log(2), c.max = 3, c.gamma = 1,
+                           c.beta = 1) {
+  d.set <- generate_data(n, beta.a, c.max, c.gamma, c.beta)
+  ps.fit <- glm(A ~ X1 + X2 + X3 + X4 + X5 + X6 + X7 + X8 + X9 + X10,
+                data = d.set, family = binomial)
+  p.score <- pmin(pmax(fitted(ps.fit), 1e-8), 1 - 1e-8)
+  p.marg <- mean(d.set$A)
+  ipw <- ifelse(d.set$A == 1, p.marg / p.score, (1 - p.marg) / (1 - p.score))
+
+  c(
+    M1 = time_once({
+      f <- coxph(Surv(time, status) ~ A, data = d.set, weights = ipw,
+                 robust = TRUE)
+      cox_rmst(f)
+    }),
+    M2 = time_once({
+      f <- fit_casebase(d.set, ipw, basis = "exponential")
+      casebase_rmst(f)
+    }),
+    M3 = time_once({
+      f <- fit_casebase(d.set, ipw, basis = "gompertz")
+      casebase_rmst(f)
+    }),
+    M4 = time_once({
+      f <- fit_casebase(d.set, ipw, basis = "spline")
+      casebase_rmst(f)
+    }),
+    M5 = time_once(coxph(Surv(time, status) ~ A + tt(A), data = d.set,
+                         weights = ipw, robust = TRUE,
+                         tt = function(x, t, ...) x * log(pmax(t, 1e-8)))),
+    M6 = time_once(fit_casebase(d.set, ipw, basis = "spline",
+                                time.varying = TRUE)),
+    events = sum(d.set$status)
+  )
+}
+
+set.seed(SEED + 7)
+timing.raw <- do.call(rbind, lapply(BENCH_N, function(n) {
+  cat(sprintf("benchmark n = %d\n", n))
+  flush.console()
+  m <- do.call(rbind, lapply(seq_len(BENCH_REPS), function(i) benchmark_fits(n)))
+  data.frame(n = n, t(colMeans(m)))
+}))
+
+timing.summary <- data.frame(
+  n = timing.raw$n,
+  events = round(timing.raw$events),
+  M1 = timing.raw$M1, M2 = timing.raw$M2, M3 = timing.raw$M3,
+  M4 = timing.raw$M4, M5 = timing.raw$M5, M6 = timing.raw$M6,
+  ratio.M4.M1 = timing.raw$M4 / timing.raw$M1
+)
+timing.summary
+
+print(xtable(timing.summary, digits = c(0, 0, 0, 3, 3, 3, 3, 3, 3, 2)),
+      include.rownames = FALSE, file = "table-sim-timing.tex")
+```
+
+# Session information
+
+```{r}
+sessionInfo()
+```

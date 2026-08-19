@@ -1,0 +1,740 @@
+---
+title: "Causal RMST under case-base sampling with IPW: Right Heart Catheterization"
+author: "Bilal Shaikh and Sumeet Kalia"
+output: pdf_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = FALSE, warning = FALSE, message = FALSE)
+```
+
+# Libraries
+
+```{r}
+library("Hmisc")
+library("survival")
+library("casebase")
+library("sandwich")
+library("splines")
+library("tableone")
+library("survey")
+library("ggplot2")
+library("grid")
+library("xtable")
+```
+
+# Configuration
+
+```{r}
+SEED <- 20260811
+CB_RATIO <- 20
+TAU_MAX <- 180
+TAU_GRID <- seq(0, TAU_MAX, by = 1)
+TAU_REPORT <- c(30, 90, 180)
+ALPHA <- 0.05
+Z_CRIT <- qnorm(1 - ALPHA / 2)
+WEIGHT_TRUNCATE <- c(0.01, 0.99)
+
+set.seed(SEED)
+dir.create("Figures/Application", recursive = TRUE, showWarnings = FALSE)
+```
+
+# Plot theme
+
+A single minimalist theme and a single palette are used for every figure so that
+the panels remain legible in greyscale. Colour and shape are mapped to the same
+grouping variable throughout, so each series is identified twice.
+
+```{r}
+PAL <- c("red", "blue", "green4", "black")
+SHP <- c(16, 17, 15, 3)
+LTY <- c("solid", "dashed", "dotdash", "dotted")
+
+theme_pub <- function(base_size = 10) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(colour = "grey90", linewidth = 0.3),
+      panel.border = element_rect(colour = "grey30", fill = NA, linewidth = 0.4),
+      strip.background = element_blank(),
+      strip.text = element_text(face = "bold", size = base_size),
+      axis.text = element_text(colour = "grey20"),
+      legend.position = "bottom",
+      legend.direction = "horizontal",
+      legend.title = element_blank(),
+      legend.key.width = unit(1.4, "lines"),
+      legend.margin = margin(t = 0)
+    )
+}
+
+legend_two <- guides(
+  colour = guide_legend(nrow = 1, ncol = 2, byrow = TRUE),
+  fill = guide_legend(nrow = 1, ncol = 2, byrow = TRUE),
+  shape = guide_legend(nrow = 1, ncol = 2, byrow = TRUE),
+  linetype = guide_legend(nrow = 1, ncol = 2, byrow = TRUE)
+)
+```
+
+# Data preparation
+
+Time zero is admission to intensive care. The treatment is right heart
+catheterization within the first twenty-four hours. Follow-up is administratively
+censored at `TAU_MAX` days.
+
+```{r}
+getHdata(rhc)
+
+rhc$time.death <- as.numeric(pmax(rhc$dthdte, rhc$lstctdte, na.rm = TRUE) -
+                               rhc$sadmdte)
+rhc$time.discharge <- as.numeric(rhc$dschdte - rhc$sadmdte)
+rhc$death <- as.integer(rhc$death == "Yes")
+rhc$A <- as.integer(rhc$swang1 == "RHC")
+
+hx.vars <- c("cardiohx", "chfhx", "dementhx", "psychhx", "chrpulhx", "renalhx",
+             "liverhx", "gibledhx", "malighx", "immunhx", "transhx", "amihx")
+rhc[hx.vars] <- lapply(rhc[hx.vars], function(x) {
+  factor(ifelse(as.numeric(x) == 1, "Yes", "No"), levels = c("No", "Yes"))
+})
+
+organ.vars <- c("resp", "card", "neuro", "gastr", "renal", "meta", "hema",
+                "seps", "trauma", "ortho")
+rhc[organ.vars] <- lapply(rhc[organ.vars], function(x) droplevels(as.factor(x)))
+
+continuous.vars <- c("age", "edu", "das2d3pc", "aps1", "scoma1", "surv2md1",
+                     "wtkilo1", "temp1", "meanbp1", "resp1", "hrt1", "pafi1",
+                     "paco21", "ph1", "wblc1", "hema1", "sod1", "pot1",
+                     "crea1", "bili1", "alb1", "urin1")
+categorical.vars <- c("sex", "race", "income", "ninsclas", "ca", "cat1", "cat2",
+                      "dnr1", hx.vars, organ.vars)
+
+impute_median <- function(x) {
+  miss <- is.na(x)
+  x[miss] <- median(x, na.rm = TRUE)
+  list(value = x, missing = as.integer(miss))
+}
+
+covariate.frame <- data.frame(row.names = seq_len(nrow(rhc)))
+for (v in continuous.vars) {
+  imp <- impute_median(as.numeric(rhc[[v]]))
+  covariate.frame[[v]] <- imp$value
+  if (any(imp$missing == 1)) covariate.frame[[paste0(v, ".miss")]] <- imp$missing
+}
+for (v in categorical.vars) {
+  x <- rhc[[v]]
+  x <- if (is.factor(x)) droplevels(x) else as.factor(x)
+  if (any(is.na(x))) {
+    x <- addNA(x)
+    levels(x)[is.na(levels(x))] <- "Missing"
+  }
+  covariate.frame[[v]] <- x
+}
+covariate.frame <- covariate.frame[, vapply(covariate.frame,
+                                            function(z) length(unique(z)) > 1,
+                                            logical(1))]
+
+data.set <- data.frame(
+  A = rhc$A,
+  time.death = rhc$time.death,
+  death = rhc$death,
+  time.discharge = rhc$time.discharge,
+  covariate.frame
+)
+data.set <- data.set[is.finite(data.set$time.death) & data.set$time.death >= 0, ]
+data.set$time.death[data.set$time.death == 0] <- 0.5
+
+covariate.names <- setdiff(names(covariate.frame), character(0))
+ps.formula <- as.formula(paste("A ~", paste(covariate.names, collapse = " + ")))
+
+nrow(data.set)
+table(data.set$A)
+```
+
+## Follow-up under each analytic principle
+
+Under the intention-to-treat analogue the outcome is death, with administrative
+censoring at `TAU_MAX` days and censoring at last contact. Under the per-protocol
+analogue each individual is additionally censored at discharge from the study
+hospital, which is the point at which continued management under the assigned
+strategy ends.
+
+```{r}
+build_followup <- function(d, principle = c("itt", "pp")) {
+  principle <- match.arg(principle)
+  admin <- pmin(d$time.death, TAU_MAX)
+  event <- as.integer(d$death == 1 & d$time.death <= TAU_MAX)
+  if (principle == "pp") {
+    dep <- ifelse(is.finite(d$time.discharge) & d$time.discharge > 0,
+                  d$time.discharge, Inf)
+    stop.time <- pmin(admin, dep)
+    event <- as.integer(event == 1 & admin <= dep)
+    d$time <- stop.time
+  } else {
+    d$time <- admin
+  }
+  d$status <- event
+  d$time[d$time <= 0] <- 0.5
+  d$cens <- as.integer(d$status == 0 & d$time < TAU_MAX)
+  d
+}
+
+itt.data <- build_followup(data.set, "itt")
+pp.data <- build_followup(data.set, "pp")
+
+c(itt.events = sum(itt.data$status), pp.events = sum(pp.data$status))
+```
+
+# Propensity score and weights
+
+```{r}
+truncate_weights <- function(w, probs = WEIGHT_TRUNCATE) {
+  lim <- quantile(w, probs = probs, na.rm = TRUE)
+  pmin(pmax(w, lim[1]), lim[2])
+}
+
+ps.fit <- glm(ps.formula, data = data.set, family = binomial)
+p.score <- pmin(pmax(fitted(ps.fit), 1e-6), 1 - 1e-6)
+p.marginal <- mean(data.set$A)
+
+iptw <- ifelse(data.set$A == 1, p.marginal / p.score,
+               (1 - p.marginal) / (1 - p.score))
+
+summary(iptw)
+sum(iptw)^2 / sum(iptw^2) / length(iptw)
+```
+
+Censoring weights are constructed from a Cox model for the censoring hazard
+fitted separately within each treatment arm, evaluated at each individual's
+observed follow-up time. The stabilized weight uses a numerator model that
+conditions on treatment alone.
+
+```{r}
+censoring_weights <- function(d) {
+  w <- numeric(nrow(d))
+  for (a.value in c(0, 1)) {
+    idx <- which(d$A == a.value)
+    d.a <- d[idx, ]
+    denom.form <- as.formula(paste("Surv(time, cens) ~",
+                                   paste(covariate.names, collapse = " + ")))
+    denom.fit <- coxph(denom.form, data = d.a)
+    base.denom <- basehaz(denom.fit, centered = FALSE)
+    lp.denom <- predict(denom.fit, newdata = d.a, type = "lp", reference = "zero")
+    h.denom <- approx(base.denom$time, base.denom$hazard, xout = d.a$time,
+                      method = "constant", rule = 2)$y
+    surv.denom <- exp(-h.denom * exp(lp.denom))
+
+    num.fit <- survfit(Surv(time, cens) ~ 1, data = d.a)
+    surv.num <- approx(num.fit$time, num.fit$surv, xout = d.a$time,
+                       method = "constant", rule = 2)$y
+
+    w[idx] <- surv.num / pmax(surv.denom, 1e-6)
+  }
+  w
+}
+
+itt.ipcw <- truncate_weights(censoring_weights(itt.data))
+pp.ipcw <- truncate_weights(censoring_weights(pp.data))
+
+itt.data$w.iptw <- truncate_weights(iptw)
+itt.data$w.both <- truncate_weights(itt.data$w.iptw * itt.ipcw)
+pp.data$w.iptw <- truncate_weights(iptw)
+pp.data$w.both <- truncate_weights(pp.data$w.iptw * pp.ipcw)
+
+weight_row <- function(principle, label, w) {
+  data.frame(principle = principle, weight = label,
+             mean = mean(w),
+             p99 = unname(quantile(w, 0.99)),
+             max = max(w),
+             ess.pct = 100 * (sum(w)^2 / sum(w^2)) / length(w),
+             row.names = NULL)
+}
+
+weight.summary <- rbind(
+  weight_row("ITT", "Treatment", itt.data$w.iptw),
+  weight_row("ITT", "Censoring", itt.ipcw),
+  weight_row("ITT", "Product", itt.data$w.both),
+  weight_row("PP", "Treatment", pp.data$w.iptw),
+  weight_row("PP", "Censoring", pp.ipcw),
+  weight_row("PP", "Product", pp.data$w.both),
+  weight_row("Untruncated", "Treatment", iptw)
+)
+weight.summary
+
+print(xtable(weight.summary, digits = c(0, 0, 0, 3, 3, 3, 1)),
+      include.rownames = FALSE, file = "table-app-weights.tex")
+```
+
+# Exploratory data analysis
+
+```{r}
+table.unweighted <- CreateTableOne(vars = covariate.names, strata = "A",
+                                   data = data.set, test = FALSE)
+print(table.unweighted, smd = TRUE)
+
+design.weighted <- svydesign(ids = ~ 1, data = data.set, weights = ~ iptw)
+table.weighted <- svyCreateTableOne(vars = covariate.names, strata = "A",
+                                    data = design.weighted, test = FALSE)
+print(table.weighted, smd = TRUE)
+
+smd_for <- function(w) {
+  if (is.null(w)) {
+    tab <- CreateTableOne(vars = covariate.names, strata = "A",
+                          data = data.set, test = FALSE)
+  } else {
+    dsn <- svydesign(ids = ~ 1, data = cbind(data.set, .w = w), weights = ~ .w)
+    tab <- svyCreateTableOne(vars = covariate.names, strata = "A",
+                             data = dsn, test = FALSE)
+  }
+  smd <- ExtractSmd(tab)
+  data.frame(covariate = rownames(smd), smd = abs(as.numeric(smd)))
+}
+
+smd.raw <- smd_for(NULL)
+smd.iptw <- smd_for(itt.data$w.iptw)
+smd.both <- smd_for(itt.data$w.both)
+
+balance.long <- rbind(
+  cbind(smd.raw, adjustment = "Unweighted"),
+  cbind(smd.iptw, adjustment = "IPTW"),
+  cbind(smd.both, adjustment = "IPTW x IPCW")
+)
+balance.long$adjustment <- factor(balance.long$adjustment,
+                                  levels = c("Unweighted", "IPTW", "IPTW x IPCW"))
+ord <- smd.raw$covariate[order(smd.raw$smd)]
+balance.long$covariate <- factor(balance.long$covariate, levels = ord)
+
+ggplot(balance.long, aes(x = smd, y = covariate, colour = adjustment,
+                         shape = adjustment, group = adjustment)) +
+  geom_vline(xintercept = 0.1, linetype = "dashed", colour = "grey40") +
+  geom_line(orientation = "y", linewidth = 0.35, alpha = 0.8) +
+  geom_point(size = 1.7) +
+  scale_colour_manual(values = PAL[1:3]) +
+  scale_shape_manual(values = SHP[1:3]) +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1),
+                     limits = c(0, max(balance.long$smd) * 1.02)) +
+  labs(x = "Absolute standardized mean difference", y = NULL) +
+  theme_pub() +
+  guides(colour = guide_legend(nrow = 1), shape = guide_legend(nrow = 1))
+ggsave("Figures/Application/covariate-balance.pdf", width = 7, height = 9)
+
+ps.cens <- numeric(nrow(itt.data))
+for (a.value in c(0, 1)) {
+  idx <- which(itt.data$A == a.value)
+  cf <- glm(as.formula(paste("cens ~", paste(covariate.names, collapse = " + "))),
+            data = itt.data[idx, ], family = binomial)
+  ps.cens[idx] <- fitted(cf)
+}
+
+overlap.frame <- rbind(
+  data.frame(score = p.score, panel = "Treatment: P(RHC | X)",
+             group = factor(data.set$A, levels = c(0, 1),
+                            labels = c("No RHC", "RHC"))),
+  data.frame(score = ps.cens, panel = "Censoring: P(censored | X, A)",
+             group = factor(itt.data$A, levels = c(0, 1),
+                            labels = c("No RHC", "RHC")))
+)
+overlap.frame$panel <- factor(overlap.frame$panel,
+                              levels = c("Treatment: P(RHC | X)",
+                                         "Censoring: P(censored | X, A)"))
+
+ggplot(overlap.frame, aes(x = score, fill = group, colour = group)) +
+  geom_histogram(bins = 50, alpha = 0.35, position = "identity",
+                 linewidth = 0.25) +
+  facet_wrap(~ panel, scales = "free_y") +
+  scale_fill_manual(values = PAL[1:2]) +
+  scale_colour_manual(values = PAL[1:2]) +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.25)) +
+  labs(x = "Estimated probability", y = "Count") +
+  theme_pub() +
+  legend_two
+ggsave("Figures/Application/propensity-overlap.pdf", width = 9, height = 4)
+```
+
+# Model fitting
+
+```{r}
+interior_knots <- function(event.times, bnd, probs = c(0.25, 0.5, 0.75)) {
+  if (length(event.times) < 20) return(numeric(0))
+  k <- unique(as.numeric(quantile(event.times, probs = probs, names = FALSE)))
+  k <- k[k > bnd[1] + .Machine$double.eps & k < bnd[2] - .Machine$double.eps]
+  sort(unique(k))
+}
+
+fit_casebase <- function(d, weights, adjust = c("none", "covariate"),
+                         time.varying = FALSE, ratio = CB_RATIO,
+                         knot.probs = c(0.25, 0.5, 0.75), seed = SEED) {
+  adjust <- match.arg(adjust)
+  d.aug <- d
+  d.aug$w <- weights
+  if (!is.null(seed)) set.seed(seed)
+  cb.data <- sampleCaseBase(d.aug, time = "time", event = "status", ratio = ratio)
+  bnd <- range(cb.data$time)
+  knot.q <- interior_knots(d$time[d$status == 1], bnd, probs = knot.probs)
+  time.term <- if (length(knot.q) > 0) {
+    sprintf("bs(time, knots = c(%s), Boundary.knots = c(%s), degree = 3)",
+            paste(knot.q, collapse = ", "), paste(bnd, collapse = ", "))
+  } else {
+    sprintf("bs(time, df = 3, Boundary.knots = c(%s), degree = 3)",
+            paste(bnd, collapse = ", "))
+  }
+  rhs <- if (time.varying) paste0("A * ", time.term) else paste0("A + ", time.term)
+  if (adjust == "covariate") {
+    rhs <- paste(rhs, "+", paste(covariate.names, collapse = " + "))
+  }
+  form <- as.formula(paste("status ~", rhs, "+ offset(offset)"))
+  fit <- glm(form, data = cb.data, family = binomial, weights = w)
+  list(fit = fit, vcov = vcovHC(fit, type = "HC0"),
+       knots = knot.q, bnd = bnd, time.varying = time.varying)
+}
+
+casebase_design <- function(cb.obj, a.value, t.grid, reference.row) {
+  nd <- reference.row[rep(1, length(t.grid)), , drop = FALSE]
+  nd$time <- pmax(t.grid, 1e-6)
+  nd$A <- a.value
+  nd$offset <- 0
+  x.grid <- model.matrix(delete.response(terms(cb.obj$fit)), data = nd)
+  x.grid[, names(coef(cb.obj$fit)), drop = FALSE]
+}
+
+rmst_from_survival <- function(t.grid, s.vec) {
+  d.t <- diff(t.grid)
+  c(0, cumsum(d.t * (head(s.vec, -1) + tail(s.vec, -1)) / 2))
+}
+
+casebase_rmst <- function(cb.obj, t.grid, reference.row) {
+  d.t <- diff(t.grid)
+  surv <- list()
+  grad <- list()
+  for (a.value in c(0, 1)) {
+    x.grid <- casebase_design(cb.obj, a.value, t.grid, reference.row)
+    lam <- as.vector(exp(x.grid %*% coef(cb.obj$fit)))
+    cum.haz <- c(0, cumsum(d.t * (head(lam, -1) + tail(lam, -1)) / 2))
+    s.vec <- exp(-cum.haz)
+    lam.x <- x.grid * lam
+    d.cum <- rbind(0, apply(lam.x, 2, function(col) {
+      cumsum(d.t * (head(col, -1) + tail(col, -1)) / 2)
+    }))
+    d.surv <- -s.vec * d.cum
+    d.rmst <- rbind(0, apply(d.surv, 2, function(col) {
+      cumsum(d.t * (head(col, -1) + tail(col, -1)) / 2)
+    }))
+    surv[[as.character(a.value)]] <- s.vec
+    grad[[as.character(a.value)]] <- d.rmst
+  }
+  grad.diff <- grad[["1"]] - grad[["0"]]
+  v.mat <- cb.obj$vcov[colnames(grad.diff), colnames(grad.diff), drop = FALSE]
+  se.vec <- sqrt(pmax(rowSums((grad.diff %*% v.mat) * grad.diff), 0))
+  data.frame(time = t.grid,
+             s0 = surv[["0"]], s1 = surv[["1"]],
+             rmst = rmst_from_survival(t.grid, surv[["1"]]) -
+               rmst_from_survival(t.grid, surv[["0"]]),
+             se = se.vec)
+}
+
+cox_rmst <- function(cox.fit, t.grid, reference.row) {
+  nd <- reference.row[rep(1, 2), , drop = FALSE]
+  nd$A <- c(0, 1)
+  sf <- survfit(cox.fit, newdata = nd)
+  s0 <- approx(sf$time, sf$surv[, 1], t.grid, method = "constant", rule = 2)$y
+  s1 <- approx(sf$time, sf$surv[, 2], t.grid, method = "constant", rule = 2)$y
+  se.psi <- sqrt(diag(vcov(cox.fit))["A"])
+  integrand <- ifelse(s1 > 0, s1 * log(pmax(s1, 1e-300)), 0)
+  g.vec <- rmst_from_survival(t.grid, integrand)
+  data.frame(time = t.grid, s0 = s0, s1 = s1,
+             rmst = rmst_from_survival(t.grid, s1) - rmst_from_survival(t.grid, s0),
+             se = abs(g.vec) * as.numeric(se.psi))
+}
+
+hr_ci <- function(estimate, se) {
+  sprintf("%.3f (%.3f, %.3f)", exp(estimate),
+          exp(estimate - Z_CRIT * se), exp(estimate + Z_CRIT * se))
+}
+```
+
+## The ten configurations
+
+```{r}
+run_configurations <- function(d, principle.label) {
+  reference.row <- d[1, , drop = FALSE]
+  cox.covariate.form <- as.formula(paste("Surv(time, status) ~ A +",
+                                         paste(covariate.names, collapse = " + ")))
+  out <- list()
+
+  c1 <- coxph(Surv(time, status) ~ A, data = d, robust = TRUE)
+  c2 <- coxph(cox.covariate.form, data = d, robust = TRUE)
+  c3 <- coxph(Surv(time, status) ~ A, data = d, weights = d$w.iptw, robust = TRUE)
+  c4 <- coxph(Surv(time, status) ~ A, data = d, weights = d$w.both, robust = TRUE)
+
+  c5 <- fit_casebase(d, rep(1, nrow(d)), adjust = "none")
+  c6 <- fit_casebase(d, rep(1, nrow(d)), adjust = "covariate")
+  c7 <- fit_casebase(d, d$w.iptw, adjust = "none")
+  c8 <- fit_casebase(d, d$w.both, adjust = "none")
+
+  c9 <- coxph(Surv(time, status) ~ A + tt(A), data = d, weights = d$w.both,
+              robust = TRUE, tt = function(x, t, ...) x * log(pmax(t, 1e-6)))
+  c10 <- fit_casebase(d, d$w.both, adjust = "none", time.varying = TRUE)
+
+  cox.list <- list(C1 = c1, C2 = c2, C3 = c3, C4 = c4)
+  cb.list <- list(C5 = c5, C6 = c6, C7 = c7, C8 = c8)
+
+  out$hr <- rbind(
+    do.call(rbind, lapply(names(cox.list), function(nm) {
+      f <- cox.list[[nm]]
+      data.frame(principle = principle.label, configuration = nm,
+                 model = "MS-Cox", estimate = unname(coef(f)["A"]),
+                 se = unname(sqrt(diag(vcov(f))["A"])))
+    })),
+    do.call(rbind, lapply(names(cb.list), function(nm) {
+      f <- cb.list[[nm]]
+      data.frame(principle = principle.label, configuration = nm,
+                 model = "Case-base", estimate = unname(coef(f$fit)["A"]),
+                 se = unname(sqrt(diag(f$vcov)["A"])))
+    }))
+  )
+  out$hr$hr.ci <- hr_ci(out$hr$estimate, out$hr$se)
+
+  out$rmst.cox <- cbind(principle = principle.label, configuration = "C4",
+                        method = "MS-Cox",
+                        cox_rmst(c4, TAU_GRID, reference.row))
+  out$rmst.cb <- cbind(principle = principle.label, configuration = "C8",
+                       method = "Case-base",
+                       casebase_rmst(c8, TAU_GRID, reference.row))
+
+  b9 <- coef(c9)
+  v9 <- vcov(c9)
+  log.t <- log(pmax(TAU_GRID, 1e-6))
+  out$hr.time <- rbind(
+    data.frame(principle = principle.label, method = "MS-Cox (C9)",
+               time = TAU_GRID,
+               loghr = b9[1] + b9[2] * log.t,
+               se = sqrt(v9[1, 1] + log.t^2 * v9[2, 2] + 2 * log.t * v9[1, 2])),
+    local({
+      x1 <- casebase_design(c10, 1, TAU_GRID, reference.row)
+      x0 <- casebase_design(c10, 0, TAU_GRID, reference.row)
+      d.x <- x1 - x0
+      data.frame(principle = principle.label, method = "Case-base (C10)",
+                 time = TAU_GRID,
+                 loghr = as.vector(d.x %*% coef(c10$fit)),
+                 se = sqrt(pmax(rowSums((d.x %*% c10$vcov) * d.x), 0)))
+    })
+  )
+  out
+}
+
+itt.results <- run_configurations(itt.data, "Intention-to-treat")
+pp.results <- run_configurations(pp.data, "Per-protocol")
+```
+
+# Results
+
+```{r}
+hr.table <- rbind(itt.results$hr, pp.results$hr)
+hr.wide <- reshape(hr.table[, c("configuration", "model", "principle", "hr.ci")],
+                   direction = "wide", idvar = c("configuration", "model"),
+                   timevar = "principle")
+hr.wide
+
+print(xtable(hr.wide), include.rownames = FALSE, file = "table-app-hr.tex")
+```
+
+```{r}
+rmst.all <- rbind(itt.results$rmst.cox, itt.results$rmst.cb,
+                  pp.results$rmst.cox, pp.results$rmst.cb)
+rmst.all$lower <- rmst.all$rmst - Z_CRIT * rmst.all$se
+rmst.all$upper <- rmst.all$rmst + Z_CRIT * rmst.all$se
+
+rmst.report <- subset(rmst.all, time %in% TAU_REPORT)
+rmst.report$cell <- sprintf("%.2f (%.2f, %.2f)", rmst.report$rmst,
+                            rmst.report$lower, rmst.report$upper)
+rmst.wide <- reshape(rmst.report[, c("principle", "method", "time", "cell")],
+                     direction = "wide", idvar = c("principle", "method"),
+                     timevar = "time")
+rmst.wide
+
+print(xtable(rmst.wide), include.rownames = FALSE, file = "table-app-rmst.tex")
+```
+
+```{r}
+ggplot(rmst.all, aes(x = time, y = rmst, colour = method, fill = method,
+                     linetype = method)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 0.6) +
+  facet_wrap(~ principle) +
+  scale_colour_manual(values = PAL[1:2]) +
+  scale_fill_manual(values = PAL[1:2]) +
+  scale_linetype_manual(values = LTY[1:2]) +
+  labs(x = "Restriction horizon (days)", y = "RMST contrast (days)") +
+  theme_pub() +
+  legend_two
+ggsave("Figures/Application/rmst-contrast.pdf", width = 9, height = 4.4)
+
+survival.long <- do.call(rbind, lapply(
+  list(itt.results$rmst.cox, itt.results$rmst.cb,
+       pp.results$rmst.cox, pp.results$rmst.cb),
+  function(z) {
+    rbind(data.frame(principle = z$principle, method = z$method, time = z$time,
+                     arm = "No RHC", surv = z$s0),
+          data.frame(principle = z$principle, method = z$method, time = z$time,
+                     arm = "RHC", surv = z$s1))
+  }))
+survival.long$series <- paste(survival.long$arm, survival.long$method, sep = ", ")
+
+ggplot(survival.long, aes(x = time, y = surv, colour = arm, linetype = method)) +
+  geom_line(linewidth = 0.6) +
+  facet_wrap(~ principle) +
+  scale_colour_manual(values = PAL[1:2]) +
+  scale_linetype_manual(values = LTY[1:2]) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = "Days since admission", y = "Counterfactual survival probability") +
+  theme_pub() +
+  guides(colour = guide_legend(nrow = 1, order = 1),
+         linetype = guide_legend(nrow = 1, order = 2))
+ggsave("Figures/Application/counterfactual-survival.pdf", width = 9, height = 4.4)
+
+hr.time.all <- rbind(itt.results$hr.time, pp.results$hr.time)
+hr.time.all$hr <- exp(hr.time.all$loghr)
+hr.time.all$lower <- exp(hr.time.all$loghr - Z_CRIT * hr.time.all$se)
+hr.time.all$upper <- exp(hr.time.all$loghr + Z_CRIT * hr.time.all$se)
+
+ggplot(subset(hr.time.all, time >= 1),
+       aes(x = time, y = hr, colour = method, fill = method, linetype = method)) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey40") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 0.6) +
+  facet_wrap(~ principle) +
+  scale_colour_manual(values = PAL[1:2]) +
+  scale_fill_manual(values = PAL[1:2]) +
+  scale_linetype_manual(values = LTY[1:2]) +
+  coord_cartesian(ylim = c(0.5, 2.5)) +
+  labs(x = "Days since admission", y = "Marginal hazard ratio") +
+  theme_pub() +
+  legend_two
+ggsave("Figures/Application/hr-time-varying.pdf", width = 9, height = 4.4)
+```
+
+# Sensitivity analyses
+
+The primary analysis truncates the stabilized weights at the first and
+ninety-ninth percentiles. The two sensitivity analyses below refit the weighted
+configurations without truncation and with the propensity score model restricted
+to the demographic and comorbidity blocks, so that the influence of the
+physiological measurements on the estimated contrast can be assessed.
+
+```{r}
+rmst_ci <- function(est, se, idx) {
+  sprintf("%.2f (%.2f, %.2f)", est[idx], est[idx] - Z_CRIT * se[idx],
+          est[idx] + Z_CRIT * se[idx])
+}
+
+TAU_IDX <- match(180, TAU_GRID)
+
+sensitivity_fit <- function(d, weights, knot.probs = c(0.25, 0.5, 0.75),
+                            ratio = CB_RATIO, include.cox = TRUE, seed = SEED) {
+  reference.row <- d[1, , drop = FALSE]
+  out <- list()
+  if (include.cox) {
+    cox.fit <- coxph(Surv(time, status) ~ A, data = d, weights = weights,
+                     robust = TRUE)
+    r.cox <- cox_rmst(cox.fit, TAU_GRID, reference.row)
+    out$cox.hr <- hr_ci(coef(cox.fit)["A"], sqrt(diag(vcov(cox.fit))["A"]))
+    out$cox.rmst <- rmst_ci(r.cox$rmst, r.cox$se, TAU_IDX)
+  } else {
+    out$cox.hr <- "n/a"
+    out$cox.rmst <- "n/a"
+  }
+  cb.fit <- fit_casebase(d, weights, adjust = "none", ratio = ratio,
+                         knot.probs = knot.probs, seed = seed)
+  r.cb <- casebase_rmst(cb.fit, TAU_GRID, reference.row)
+  out$cb.hr <- hr_ci(coef(cb.fit$fit)["A"], sqrt(diag(cb.fit$vcov)["A"]))
+  out$cb.rmst <- rmst_ci(r.cb$rmst, r.cb$se, TAU_IDX)
+  as.data.frame(out, stringsAsFactors = FALSE)
+}
+
+untruncated <- iptw * itt.ipcw
+
+reduced.names <- intersect(covariate.names,
+                           c("age", "sex", "race", "edu", "income", "ninsclas",
+                             hx.vars))
+ps.reduced <- glm(as.formula(paste("A ~", paste(reduced.names, collapse = " + "))),
+                  data = data.set, family = binomial)
+p.reduced <- pmin(pmax(fitted(ps.reduced), 1e-6), 1 - 1e-6)
+w.reduced <- truncate_weights(ifelse(data.set$A == 1, p.marginal / p.reduced,
+                                     (1 - p.marginal) / (1 - p.reduced)))
+
+sensitivity.table <- rbind(
+  cbind(analysis = "Primary analysis",
+        sensitivity_fit(itt.data, itt.data$w.both)),
+  cbind(analysis = "No weight truncation",
+        sensitivity_fit(itt.data, untruncated)),
+  cbind(analysis = "Reduced propensity score model",
+        sensitivity_fit(itt.data, w.reduced)),
+  cbind(analysis = "Two interior spline knots",
+        sensitivity_fit(itt.data, itt.data$w.both,
+                        knot.probs = c(1/3, 2/3), include.cox = FALSE)),
+  cbind(analysis = "Five interior spline knots",
+        sensitivity_fit(itt.data, itt.data$w.both,
+                        knot.probs = seq(1, 5) / 6, include.cox = FALSE)),
+  cbind(analysis = "Sampling ratio 10",
+        sensitivity_fit(itt.data, itt.data$w.both, ratio = 10,
+                        include.cox = FALSE)),
+  cbind(analysis = "Sampling ratio 100",
+        sensitivity_fit(itt.data, itt.data$w.both, ratio = 100,
+                        include.cox = FALSE))
+)
+sensitivity.table
+
+print(xtable(sensitivity.table), include.rownames = FALSE,
+      file = "table-app-sensitivity.tex")
+```
+
+# Case-base resampling variability
+
+The base series is drawn at random, so two fits with identical specifications
+differ by the realization of that draw. The sandwich variance conditions on the
+realized sample and does not include this component. The analysis below refits
+configuration C8 under independent draws and compares the resulting spread with
+the reported standard error, at two sampling ratios.
+
+```{r}
+N_DRAWS <- 200
+
+resample_spread <- function(d, weights, ratio, n.draws = N_DRAWS) {
+  reference.row <- d[1, , drop = FALSE]
+  out <- t(vapply(seq_len(n.draws), function(k) {
+    f <- fit_casebase(d, weights, adjust = "none", ratio = ratio,
+                      seed = SEED + k)
+    r <- casebase_rmst(f, TAU_GRID, reference.row)
+    c(loghr = unname(coef(f$fit)["A"]),
+      se.loghr = unname(sqrt(diag(f$vcov)["A"])),
+      rmst = r$rmst[TAU_IDX],
+      se.rmst = r$se[TAU_IDX])
+  }, numeric(4)))
+  data.frame(
+    ratio = ratio,
+    mean.loghr = mean(out[, "loghr"]),
+    sd.loghr = sd(out[, "loghr"]),
+    ase.loghr = mean(out[, "se.loghr"]),
+    share.loghr = 100 * (sd(out[, "loghr"]) / mean(out[, "se.loghr"]))^2,
+    mean.rmst = mean(out[, "rmst"]),
+    sd.rmst = sd(out[, "rmst"]),
+    ase.rmst = mean(out[, "se.rmst"]),
+    share.rmst = 100 * (sd(out[, "rmst"]) / mean(out[, "se.rmst"]))^2
+  )
+}
+
+resampling.table <- do.call(rbind, lapply(c(10, 20, 100), function(r) {
+  cat(sprintf("resampling spread at ratio %d\n", r))
+  flush.console()
+  resample_spread(itt.data, itt.data$w.both, ratio = r)
+}))
+resampling.table
+
+print(xtable(resampling.table, digits = c(0, 0, 4, 4, 4, 1, 3, 3, 3, 1)),
+      include.rownames = FALSE, file = "table-app-resampling.tex")
+```
+
+# Session information
+
+```{r}
+sessionInfo()
+```
